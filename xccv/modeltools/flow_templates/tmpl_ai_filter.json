@@ -1,0 +1,25 @@
+{
+ "template": "tmpl_ai_filter",
+ "title": "AI 检测 + 过滤 + 数量判定",
+ "description": "载图 → 目标检测模型 → 置信度过滤 → 数量判定。「传统粗筛 + AI 精判」的入门链：在目标检测模型属性里选择 .xva/.pt 权重后即可运行；分割/分类任务请换用对应的模型节点；过滤条件按产线标准调整。",
+ "last_node_id": 4, "last_link_id": 3,
+ "nodes": [
+  {"id": 1, "type": "xccv2/image_loader", "pos": [60, 200],
+   "properties": {"path": "", "is_grayscale": false},
+   "inputs": [], "outputs": [{"name": "image", "type": "image", "links": [1]}]},
+  {"id": 2, "type": "xccv2/model_detection", "pos": [340, 200],
+   "properties": {"model_path": "", "conf": 0.25, "iou": 0.45, "device": "auto"},
+   "inputs": [{"name": "image", "type": "image", "link": 1}],
+   "outputs": [{"name": "detection", "type": "detection", "links": [2]}]},
+  {"id": 3, "type": "xccv2/filter_confidence", "pos": [620, 200],
+   "properties": {"min": 0.4},
+   "inputs": [{"name": "detection", "type": "detection", "link": 2}],
+   "outputs": [{"name": "detection", "type": "detection", "links": [3]}]},
+  {"id": 4, "type": "xccv2/filter_count_check", "pos": [900, 200],
+   "properties": {"min": 1, "max": 0},
+   "inputs": [{"name": "detection", "type": "detection", "link": 3}],
+   "outputs": [{"name": "detection", "type": "detection", "links": []},
+                {"name": "passed", "type": "bool", "links": []}]}
+ ],
+ "links": [[1, 1, 0, 2, 0], [2, 2, 0, 3, 0], [3, 3, 0, 4, 0]]
+}

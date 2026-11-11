@@ -1,0 +1,31 @@
+# UI 框架（GPL v3，如需闭源分发请改用 PySide6 并自行调整 import，或购买 Riverbank 商业许可）
+PyQt5==5.15.9
+PyQtWebEngine==5.15.7
+
+# 深度学习（torch/torchvision 请先按官方源安装，CUDA 版示例：
+#   pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
+# CPU 版直接 pip install torch torchvision 即可）
+ultralytics==8.4.7
+onnxruntime==1.19.2
+
+# 图像与数值
+numpy==2.4.6
+opencv-python==4.11.0.86
+Pillow==13.0.0
+scikit-image==0.26.0
+imgviz==2.1.0
+natsort==8.4.0
+PyYAML==6.0.3
+
+# 指标与可视化
+pycocotools==2.0.11
+matplotlib==3.9.2
+pyqtgraph==0.13.7
+
+# 缺陷样本合成（本地 Web 服务）
+fastapi==0.141.1
+uvicorn==0.53.0
+pydantic==2.13.5
+
+# 日志
+loguru==0.7.3

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行期用户数据
+platform_data/
+
+# 权重与数据（体积大且许可各异，不随仓库分发）
+weights/
+xccv/engine/weights/
+*.pt
+*.pth
+*.onnx
+
+# 训练数据与产物
+traintest/
+runs/
+输出*/
+检出结果/
+可视化/
+
+# IDE / 系统
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

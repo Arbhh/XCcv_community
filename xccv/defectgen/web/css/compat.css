@@ -1,0 +1,7 @@
+/* 内嵌浏览器（Chromium 83）无 inset 简写 */
+#cv, #emptyHint { top: 0; right: 0; bottom: 0; left: 0; }
+/* 工具条换行：按钮多于窗口宽度时不藏到横向滚动条外（导出/批量在最右侧） */
+#topbar { flex-wrap: wrap; overflow-x: visible; }
+/* 资产卡片按钮无 .btn 类，默认外观在深色主题下刺眼 */
+.asset-btns button { flex: 1; padding: 2px 4px; font-size: 11px; color: var(--text); background: var(--bg2); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
+.asset-btns button:hover { border-color: var(--accent); }

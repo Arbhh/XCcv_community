@@ -1,0 +1,1531 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>XCcv 流程图画布</title>
+<link rel="stylesheet" href="litegraph.css">
+<style>
+html,body{margin:0;height:100%;overflow:hidden}
+body{font-family:"Microsoft YaHei",sans-serif;background:#f4f7fb;color:#1e293b;
+     display:flex;flex-direction:column}
+/* 性能架构：画布用 LiteGraph 单 <canvas> 渲染，节点/连线状态
+   全部保存在 JS 内存（LGraph）。编辑（增删/连线/拖动/改属性）零后端调用，
+   只有 保存 / 打包 / 运行预览 才 serialize 后走 QWebChannel 桥接。 */
+#topbar{display:flex;align-items:center;gap:8px;padding:8px 12px;
+        background:#fff;border-bottom:1px solid #e2e8f0;flex:0 0 auto}
+#topbar .title{font-weight:900;font-size:14px;margin-right:8px}
+#topbar button{border:1px solid #dbe4f0;background:#fff;border-radius:8px;
+        padding:5px 12px;cursor:pointer;font-size:13px}
+#topbar button.accent{background:#2f95b3;border-color:#2f95b3;color:#fff;font-weight:700}
+#topbar button.accent.green{background:#16a34a;border-color:#16a34a}
+#status{font-size:12px;color:#64748b;margin-left:auto}
+#main{display:flex;flex:1 1 auto;min-height:0}
+#palette{width:250px;flex:0 0 auto;background:#fff;border-right:1px solid #e2e8f0;
+         padding:8px;user-select:none;display:flex;flex-direction:column}
+#palette-tabs{display:flex;gap:6px;margin-bottom:6px;flex:0 0 auto}
+#palette-tabs button{flex:1;border:1px solid #cbd5e1;background:#fff;border-radius:8px;
+   padding:6px 0;cursor:pointer;font-size:13px;color:#475569}
+#palette-tabs button.active{background:#2f95b3;border-color:#2f95b3;color:#fff;font-weight:700}
+#palette-list{flex:1 1 auto;overflow-y:auto;min-height:0}
+#palette h3{font-size:13px;color:#0f172a;margin:10px 4px 4px;font-weight:800}
+#palette .subcat{font-size:11px;color:#94a3b8;margin:6px 4px 2px}
+#palette .item{border:1px solid #cbd5e1;border-radius:8px;padding:8px 10px;
+         margin:4px 0;font-size:13px;cursor:grab;background:#fff}
+#palette .item:hover{background:#e4f6fa;border-color:#8ed7e6}
+#palette .item.is-dragging{opacity:.5;cursor:grabbing}
+#palette input{width:94%;padding:5px 8px;border:1px solid #dbe4f0;border-radius:8px;
+         font-size:13px;margin-bottom:6px;flex:0 0 auto}
+#canvasbox{flex:1 1 auto;min-width:0;position:relative}
+#flowcanvas{width:100%;height:100%;display:block;outline:none}
+#nodecount{font-size:12px;color:#64748b;padding:2px 8px}
+/* 运行日志面板（日志捕捉：节点级日志，可定位到 节点名(#id)） */
+#logpanel{position:absolute;left:14px;bottom:14px;width:calc(100% - 380px);max-width:640px;
+   max-height:230px;display:none;flex-direction:column;border:1px solid #cbd5e1;
+   border-radius:10px;background:#fff;box-shadow:0 4px 16px rgba(15,23,42,.14);z-index:10}
+#logpanel .log-head{display:flex;align-items:center;justify-content:space-between;
+   padding:6px 10px;border-bottom:1px solid #e2e8f0;font-size:12px;color:#475569}
+#logpanel .log-head button{border:none;background:none;cursor:pointer;color:#64748b;font-size:14px}
+#logpanel pre{margin:0;padding:8px 10px;overflow:auto;font-family:Consolas,monospace;
+   font-size:12px;line-height:1.55;color:#0f172a;white-space:pre-wrap;max-height:190px}
+#preview{position:absolute;right:14px;bottom:14px;max-width:360px;max-height:300px;
+         border:1px solid #e2e8f0;border-radius:8px;background:#fff;display:none;
+         box-shadow:0 4px 16px rgba(15,23,42,.12);z-index:9}
+/* 节点属性面板：右键节点显示（可编辑），再次右键关闭 */
+#inspector{position:absolute;right:14px;top:14px;width:300px;max-height:calc(100% - 28px);
+   overflow-y:auto;border:1px solid #cbd5e1;border-radius:10px;background:#fff;
+   box-shadow:0 4px 16px rgba(15,23,42,.14);padding:10px;font-size:13px;display:none;z-index:10}
+#inspector .ins-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:4px}
+#inspector h4{margin:0;font-size:14px;color:#0f172a}
+#inspector .ins-close{border:none;background:none;font-size:16px;cursor:pointer;color:#64748b}
+#inspector .sub{color:#94a3b8;font-size:11px;margin-bottom:8px;word-break:break-all}
+#inspector .row{margin:8px 0}
+#inspector .row .k{color:#475569;font-size:12px;margin-bottom:2px}
+#inspector .row input[type=text],#inspector .row input[type=number],
+#inspector .row textarea,#inspector .row select{width:96%;padding:5px 7px;
+   border:1px solid #cbd5e1;border-radius:6px;font-size:13px;background:#fff;color:#0f172a}
+#inspector .row textarea{height:44px;font-family:Consolas,monospace}
+#inspector .row .v{font-family:Consolas,monospace;font-size:12px;color:#0f172a;
+   word-break:break-all;background:#f1f5f9;border-radius:5px;padding:3px 6px}
+#inspector .hint{color:#94a3b8;font-size:11px;margin-top:2px}
+#inspector button{border:1px solid #cbd5e1;background:#e4f6fa;border-radius:6px;
+   padding:4px 10px;cursor:pointer;font-size:13px}
+#inspector button.accent{background:#2f95b3;border-color:#2f95b3;color:#fff}
+/* 区域绘制（矩形/圆/多边形；属性面板内嵌 + 放大编辑；SVG 叠加层用图片自然像素坐标） */
+.rp-box{margin-top:6px;border:1px solid #e2e8f0;border-radius:8px;
+   background:#f8fbff;padding:6px}
+.rp-box .rp-pathrow{display:flex;gap:6px;align-items:center;margin-bottom:6px}
+.rp-box .rp-path{flex:1;min-width:0;font-size:11px;color:#475569;background:#fff;
+   border:1px solid #e2e8f0;border-radius:5px;padding:3px 6px;
+   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#inspector .rp-box button,#rp-modal .rp-box button{border:1px solid #cbd5e1;background:#fff;
+   border-radius:6px;padding:3px 10px;cursor:pointer;font-size:12px;color:#0f172a}
+.rp-box .rp-toolbar{display:flex;gap:4px;margin-bottom:6px}
+#inspector .rp-toolbar button,#rp-modal .rp-toolbar button{flex:1;padding:4px 0}
+#inspector .rp-toolbar button.on,#rp-modal .rp-toolbar button.on{background:#2f95b3;
+   border-color:#2f95b3;color:#fff;font-weight:700}
+.rp-box .rp-imgwrap{text-align:center;line-height:0;overflow:auto}
+#ins-body .rp-box .rp-imgwrap{max-height:430px}
+#rp-modal .rp-box .rp-imgwrap{max-height:calc(90vh - 165px)}
+.rp-box .rp-imgbox{position:relative;display:inline-block;line-height:0;max-width:100%;
+   cursor:crosshair;outline:none;touch-action:none}
+.rp-box img.rp-img{max-width:100%;max-height:300px;display:block;user-select:none;
+   -webkit-user-drag:none}
+.rp-box svg.rp-svg{position:absolute;left:0;top:0;overflow:visible}
+.rp-box .rp-bg{fill:transparent}
+.rp-box .rp-shape{fill:rgba(220,38,38,.10);stroke:#dc2626;stroke-width:1.6;cursor:move}
+.rp-box .rp-shape.sel{fill:rgba(220,38,38,.22);stroke:#b91c1c;stroke-width:2.4}
+.rp-box .rp-h{fill:#b91c1c;stroke:#fff;stroke-width:2;cursor:pointer}
+.rp-box .rp-draft{fill:rgba(17,128,156,.10);stroke:#11809c;stroke-width:1.6;
+   stroke-dasharray:6 4;pointer-events:none}
+.rp-box .rp-v{fill:#11809c;stroke:#fff;stroke-width:1.5;pointer-events:none}
+.rp-box .rp-v.first{fill:#16a34a}
+.rp-box .rp-lbl{fill:#fff;stroke:#b91c1c;stroke-width:3px;paint-order:stroke;
+   font-weight:700;pointer-events:none}
+.rp-box .rp-read{font-size:11px;color:#334155;margin-top:4px;line-height:1.5}
+.rp-box .rp-tools{display:flex;gap:8px;margin-top:4px}
+/* 放大编辑：全窗口遮罩（QtWebEngine 5.15 不支持 inset 简写，四边分写） */
+#rp-modal{position:fixed;left:0;top:0;right:0;bottom:0;background:rgba(15,23,42,.45);
+   z-index:50;display:none;align-items:center;justify-content:center}
+#rp-modal .rp-card{background:#fff;border-radius:12px;padding:10px 14px;width:92vw;height:90vh;
+   display:flex;flex-direction:column;box-shadow:0 10px 40px rgba(15,23,42,.35);box-sizing:border-box}
+#rp-modal .rp-card-head{display:flex;align-items:center;gap:10px;margin-bottom:6px;font-size:13px}
+#rp-modal .rp-card-head .hint{color:#64748b;font-size:12px;flex:1}
+#rp-modal .rp-card-head button{border:1px solid #2f95b3;background:#2f95b3;color:#fff;
+   border-radius:6px;padding:4px 14px;cursor:pointer;font-weight:700}
+#rp-modal .rp-box{flex:1;min-height:0;margin:0;overflow:auto}
+#rp-modal .rp-box img.rp-img{max-height:calc(90vh - 175px)}
+</style>
+</head>
+<body>
+<div id="topbar">
+  <span class="title">流程图画布</span>
+  <button onclick="act('new')">新建</button>
+  <button onclick="act('new_from_template')">从模板创建</button>
+  <button onclick="act('open')">打开</button>
+  <button onclick="saveJson()">保存 JSON</button>
+  <button class="accent" onclick="act('save_xvap', {flow: serialize()})">打包 .xvap</button>
+  <button class="accent green" onclick="runPreview()">运行预览</button>
+  <button onclick="fitView()">适配画布</button>
+  <button onclick="toggleLogs()">运行日志</button>
+  <span id="status">新建或打开流程后开始编辑</span>
+</div>
+<div id="main">
+  <div id="palette">
+    <input id="search-box" placeholder="搜索节点…">
+    <div id="palette-tabs">
+      <button id="tab-ai" class="active" onclick="switchTab('ai')">AI 算子</button>
+      <button id="tab-common" onclick="switchTab('common')">通用算子</button>
+    </div>
+    <div id="nodecount">节点 0</div>
+    <div id="palette-list"><div id="palette-groups"></div></div>
+    <div id="palette-desc" style="display:none;border-top:1px solid #e2e8f0;
+        padding:8px 4px 2px;font-size:12px;color:#334155;
+        line-height:1.5;background:#fbfdff"></div>
+  </div>
+  <div id="canvasbox">
+    <canvas id="flowcanvas" tabindex="99"></canvas>
+    <img id="preview" alt="运行预览">
+    <div id="logpanel">
+      <div class="log-head"><span id="log-title">运行日志</span>
+        <button onclick="toggleLogs()">×</button></div>
+      <pre id="logtext">（尚无日志——运行流程后此处按节点显示执行/警告/错误，
+格式：[级别] 节点名(#id)：消息，可精确定位出错节点）</pre>
+    </div>
+    <div id="inspector">
+      <div class="ins-head"><h4 id="ins-title">节点属性</h4>
+        <button class="ins-close" onclick="hideInspector()">×</button></div>
+      <div class="sub" id="ins-sub"></div>
+      <div id="ins-body"></div>
+    </div>
+  </div>
+</div>
+<div id="rp-modal"><div class="rp-card">
+  <div class="rp-card-head"><b>区域绘制（放大编辑）</b>
+    <span class="hint">矩形=拖拽；圆=按下定圆心拖出半径；多边形=单击加点、双击/回车/点回首点闭合、右键或 Backspace 撤点；选中后拖动或拖把手改形，Delete 删除</span>
+    <button type="button" onclick="rpCloseBig()">完成</button></div>
+  <div class="rp-box"></div>
+</div></div>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script>
+// Chromium 87（QtWebEngine 5.15）无原生 roundRect：为 LiteGraph 补齐。
+// 负/零宽高（加载退化 size 的节点）会让 arcTo 抛 IndexSizeError 中断整个
+// 绘制帧（用户实测"保存重开节点渲染显示异常"），此处必须防护跳过
+if(window.CanvasRenderingContext2D && !CanvasRenderingContext2D.prototype.roundRect){
+  CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r){
+    if(!(w > 0) || !(h > 0)) {       // 退化矩形直接跳过，绝不让绘制中断
+      this.moveTo(x, y);
+      return this;
+    }
+    if(typeof r !== "number") r = (Array.isArray(r) ? r[0] : 0) || 0;
+    r = Math.min(Math.max(r, 0), w / 2, h / 2);
+    this.moveTo(x + r, y);
+    this.arcTo(x + w, y, x + w, y + h, r);
+    this.arcTo(x + w, y + h, x, y + h, r);
+    this.arcTo(x, y + h, x, y, r);
+    this.arcTo(x, y, x + w, y, r);
+    this.closePath();
+    return this;
+  };
+}
+</script>
+<script>if(!location.search.includes("nolg")) document.write('<script src="litegraph.js"><\/script>');</script>
+<script>
+// ================= 桥接（编辑零后端调用；仅保存/打包/运行预览触发） =================
+let backend = null;
+function act(action, extra){
+  const msg = JSON.stringify(Object.assign({action: action}, extra || {}));
+  if(backend) backend.postMessage(msg);
+  else console.log("XCCV:" + msg);   // 通道就绪前兜底（Qt 侧兼容入口）
+}
+if(window.qt && qt.webChannelTransport){
+  new QWebChannel(qt.webChannelTransport, ch => {
+    backend = ch.objects.backend;
+    backend.eventArrived.connect(payload => {
+      try { handleEvent(JSON.parse(payload)); } catch(e){ console.warn("事件解析失败", e); }
+    });
+    backend.postMessage(JSON.stringify({action: "js_ready"}));
+  });
+}
+function handleEvent(payload){
+  if(payload.event === "loaded"){ loadFlow(payload.flow); setStatus("已打开 " + (payload.name || "")); }
+  else if(payload.event === "status"){ setStatus(payload.text); }
+  else if(payload.event === "node_library"){ applyNodeLibrary(payload); }
+  else if(payload.event === "run_result"){ applyRunResult(payload); }
+  else if(payload.event === "snapshot"){
+    if(insNode && insNode.id === payload.node_id) renderSnapshots(payload.images || {}); }
+  else if(payload.event === "param_file"){
+    const n = graph.getNodeById(payload.node_id);
+    if(n){ n.properties[payload.key] = payload.path; syncNodeWidget(n, payload.key);
+           if(insNode && insNode.id === n.id) showInspector(n);
+           graph.setDirtyCanvas(true, true); } }
+  else if(payload.event === "model_file"){
+    const n = graph.getNodeById(payload.node_id);
+    if(n){ n.properties.model_file = payload.path; syncModelWidget(n);
+           if(insNode && insNode.id === n.id) showInspector(n);
+           graph.setDirtyCanvas(true, true); } }
+  else if(payload.event === "image_for_regions"){ rpEvent(payload); }
+  else if(payload.event === "preview"){
+    const img = document.getElementById("preview");
+    img.src = "data:image/png;base64," + payload.png; img.style.display = "block";
+    setStatus(payload.text || "预览已更新"); }
+}
+function setStatus(s){ document.getElementById("status").textContent = s; }
+// ================= 运行日志面板（节点级日志，精确定位到 节点名(#id)） =================
+let RUN_ERRORS = {};
+function toggleLogs(){
+  const p = document.getElementById("logpanel");
+  p.style.display = (p.style.display === "flex") ? "none" : "flex";
+}
+function showLogs(text){
+  const p = document.getElementById("logpanel");
+  document.getElementById("logtext").textContent =
+      text || "（本次运行无日志——全部节点成功且无警告）";
+  p.style.display = "flex";
+}
+function applyRunResult(payload){
+  RUN_ERRORS = payload.errors || {};
+  for(const n of graph._nodes) n.boxcolor = "";
+  for(const idStr of Object.keys(RUN_ERRORS)){
+    const n = graph.getNodeById(+idStr);
+    if(n) n.boxcolor = "#dc2626";   // 失败节点红框（批次十九：节点错误标红）
+  }
+  graph.setDirtyCanvas(true, true);
+  showLogs(payload.logs || "");
+  setStatus(payload.status || "运行完成");
+  // 快照实时刷新（用户实测：属性面板开着时快照不更新，需重开才显示）
+  if(insNode) act("get_snapshot", {node_id: insNode.id});
+}
+const _base = p => String(p || "").split(/[\\/]/).pop();
+
+// ================= 节点定义（类型串与既有 .json/.xvap 完全兼容） =================
+// 浅蓝主题：color=标题条/描边（加深保证可见度），bgcolor=节点体（白）
+const DEFS = {
+  "xccv/input_image":        {title:"输入图像",     cat:"输入",  color:"#3b82f6", bgcolor:"#ffffff", params:{}},
+  "xccv/model_detection":    {title:"目标检测模型", cat:"模型",  color:"#2f95b3", bgcolor:"#ffffff", params:{model_file:"", threshold:0.25, iou_threshold:0.45}},
+  "xccv/model_instance_seg": {title:"实例分割模型", cat:"模型",  color:"#2f95b3", bgcolor:"#ffffff", params:{model_file:"", threshold:0.25, iou_threshold:0.45}},
+  "xccv/model_classification":{title:"分类模型",    cat:"模型",  color:"#2f95b3", bgcolor:"#ffffff", params:{model_file:""}},
+  "xccv/post_confidence":    {title:"置信度过滤",   cat:"后处理", color:"#6366f1", bgcolor:"#ffffff", params:{min:0.25}},
+  "xccv/post_class_filter":  {title:"类别过滤",     cat:"后处理", color:"#6366f1", bgcolor:"#ffffff", params:{keep:""}},
+  "xccv/post_bbox_size":     {title:"bbox 宽高过滤",cat:"后处理", color:"#6366f1", bgcolor:"#ffffff", params:{w_min:0, w_max:0, h_min:0, h_max:0}},
+  "xccv/post_bbox_area":     {title:"bbox 面积过滤",cat:"后处理", color:"#6366f1", bgcolor:"#ffffff", params:{min:0, max:0}},
+  "xccv/post_mask_area":     {title:"mask 面积过滤",cat:"后处理", color:"#6366f1", bgcolor:"#ffffff", params:{min:0, max:0}},
+  "xccv/post_region_block":  {title:"屏蔽区域",     cat:"后处理", color:"#6366f1", bgcolor:"#ffffff", params:{regions:""}},
+  "xccv/post_region_keep":   {title:"保留区域",     cat:"后处理", color:"#6366f1", bgcolor:"#ffffff", params:{regions:""}},
+  "xccv/post_count_check":   {title:"数量判定",     cat:"后处理", color:"#6366f1", bgcolor:"#ffffff", params:{min:0, max:0}},
+  "xccv/output":             {title:"输出结果",     cat:"输出",  color:"#0284c7", bgcolor:"#ffffff", params:{}},
+};
+
+// ================= 浅蓝主题（覆盖 LiteGraph 深色默认值） =================
+LiteGraph.NODE_TITLE_COLOR = "#1e293b";        // 标题文字（未选中）
+LiteGraph.NODE_SELECTED_TITLE_COLOR = "#facc15"; // 标题文字（选中，蓝底黄字）
+LiteGraph.NODE_TEXT_COLOR = "#334155";         // 槽位标签等节点文字
+LiteGraph.NODE_DEFAULT_COLOR = "#3b82f6";      // 节点描边兜底
+LiteGraph.NODE_DEFAULT_BGCOLOR = "#ffffff";    // 节点体兜底
+LiteGraph.NODE_DEFAULT_BOXCOLOR = "#bfdbfe";
+LiteGraph.NODE_BOX_OUTLINE_COLOR = "#93c5fd";
+LiteGraph.NODE_HOVER_CURSOR = "grab";           // 悬停节点=拖动语义（手型），端口才是连线
+LiteGraph.WIDGET_BGCOLOR = "#ffffff";          // 参数控件底色
+LiteGraph.WIDGET_OUTLINE_COLOR = "#bfdbfe";
+LiteGraph.WIDGET_TEXT_COLOR = "#1e293b";
+LiteGraph.WIDGET_SECONDARY_TEXT_COLOR = "#64748b";
+LiteGraph.WIDGET_BUTTON_BGCOLOR = "#dbeafe";   // 按钮控件底色（vendored 库已支持）
+LiteGraph.LINK_COLOR = "#2f95b3";
+LiteGraph.EVENT_LINK_COLOR = "#2f95b3";
+LiteGraph.CONNECTING_LINK_COLOR = "#5ec6dd";
+
+const graph = new LGraph();
+const canvas = new LGraphCanvas("#flowcanvas", graph);
+canvas.background_image = null;
+canvas.render_shadows = false;
+canvas.allow_searchbox = false;   // 搜索框会列出内置演示节点，禁用
+canvas.clear_background_color = "#f4f7fb";  // 画布底 = 平台浅蓝灰
+canvas.node_title_color = "#1e293b";
+canvas.default_link_color = "#2f95b3";
+canvas.default_connection_color = {
+  input_off: "#5ec6dd", input_on: "#1d4ed8",
+  output_off: "#5ec6dd", output_on: "#2f95b3",
+};
+
+function registerFlowNode(type, def){
+  const isModel = !!def.params.model_file || type.startsWith("xccv/model");
+  function FlowNode(){
+    if(type !== "xccv/input_image") this.addInput("图像", "image");
+    if(type !== "xccv/output") this.addOutput("图像", "image");
+    this.properties = JSON.parse(JSON.stringify(def.params));
+    for(const [k, v] of Object.entries(def.params)){
+      if(k === "model_file"){
+        // 显示控件只显示文件名（长路径在节点上放不下）；完整路径存 properties
+        const w = this.addWidget("text", "model_file", "（未选择）");
+        w.disabled = true;
+      } else if(typeof v === "number"){
+        this.addWidget("number", k, v, null, {property: k});
+      } else if(typeof v === "boolean"){
+        this.addWidget("toggle", k, v, null, {property: k});
+      } else {
+        this.addWidget("text", k, String(v == null ? "" : v), null, {property: k});
+      }
+    }
+    if(isModel){
+      this.addWidget("button", "pick_model", "选择模型文件…",
+          function(_v, _w, node){   // 回调 this 非 node，用第三参
+            if(node) act("pick_model", {node_id: node.id});
+          });
+    }
+  }
+  FlowNode.title = def.title;
+  FlowNode.title_color = def.color;
+  FlowNode.title_text_color = "#ffffff";
+  FlowNode.prototype.onConfigure = function(){
+    // 载入旧流程文件时把 properties 同步回画布控件
+    for(const w of (this.widgets || [])){
+      if(w.name === "model_file") w.value = _base(this.properties.model_file) || "（未选择）";
+      else if(this.properties[w.name] !== undefined) w.value = this.properties[w.name];
+    }
+  };
+  LiteGraph.registerNodeType(type, FlowNode);
+}
+for(const [type, def] of Object.entries(DEFS)) registerFlowNode(type, def);
+// 内置演示节点不入库（避免右键/搜索出现无关类型）；xccv2/ 为新算子前缀，一并保留
+for(const k of Object.keys(LiteGraph.registered_node_types))
+  if(!(k.startsWith("xccv/") || k.startsWith("xccv2/")))
+    delete LiteGraph.registered_node_types[k];
+
+// ================= 新算子节点系统（批次十九：Python registry 下发 schema） =================
+// 类型串 = "xccv2/<注册名>"：与旧 .json/.xvap 的 xccv/ 类型完全隔离；
+// graph_to_chain 不识别 xccv2/（旧链运行忽略新节点），新引擎按 xccv2/ 运行。
+const SCHEMA = {};          // type -> {name, category, desc, inputs, outputs, params}
+const PORT_COLORS = {};     // 端口类型 -> 颜色（PORT_TYPES 下发，不重复维护）
+const PORT_DESC = {};       // 端口类型 -> 中文描述（连线拒绝提示用）
+const CAT_GROUP = {         // 节点库分组（社区版：AI 算子 / 通用算子）
+  "图像源": "输入", "AI": "AI 算子",
+  "逻辑": "通用算子", "检出过滤": "通用算子", "测量": "通用算子",
+  "自定义": "通用算子", "通用": "通用算子", "输出": "通用算子",
+};
+function applyNodeLibrary(payload){
+  for(const [t, info] of Object.entries(payload.port_types || {})){
+    PORT_COLORS[t] = info.color;
+    PORT_DESC[t] = info.desc || t;
+  }
+  for(const c of Object.keys(PORT_COLORS))
+    if(LGraphCanvas.link_type_colors) LGraphCanvas.link_type_colors[c] = PORT_COLORS[c];
+  for(const def of (payload.nodes || [])){
+    const type = "xccv2/" + def.name;
+    SCHEMA[type] = def;
+    registerSchemaNode(type, def);
+  }
+  buildPalette(document.getElementById("search-box").value.trim());
+  setStatus("已载入算子库：" + (payload.nodes || []).length + " 个算子");
+  // 竞态防线：载入流程时库未就绪被搁置的流程，现在重新载入
+  if(_pendingFlow){
+    const f = _pendingFlow; _pendingFlow = null;
+    loadFlow(f);
+    setStatus("已重新载入流程");
+  }
+}
+let _pendingFlow = null;
+function registerSchemaNode(type, def){
+  function SchemaNode(){
+    for(const p of def.inputs) this.addInput(p.label || p.name, p.type);
+    for(const p of def.outputs) this.addOutput(p.label || p.name, p.type);
+    this.properties = {};
+    for(const [k, spec] of Object.entries(def.params)){
+      this.properties[k] = JSON.parse(JSON.stringify(spec.default));
+      const label = spec.label || k;
+      // widget 名必须=参数键（同步/回填按 name 匹配），中文显示走 w.label
+      if(spec.type === "int" || spec.type === "float"){
+        const w = this.addWidget("number", k, spec.default, null, {property: k});
+        w.label = label;
+        if(spec.range) w.options = {min: spec.range[0], max: spec.range[1]};
+      } else if(spec.type === "bool"){
+        const w = this.addWidget("toggle", k, spec.default, null, {property: k});
+        w.label = label;
+      } else if(spec.type === "enum" &&
+                (spec.options || []).every(o => typeof o === "string")){
+        // 非字符串枚举（如 [3,5,7]）落入下方数字控件：combo 只会写回字符串，
+        // 运行期 schema 校验会拒绝 "3" ∉ [3,5,7]
+        const w = this.addWidget("combo", k, String(spec.default), null,
+            {property: k, values: spec.options.map(String)});
+        w.label = label;
+      } else if(spec.type === "enum"){
+        const w = this.addWidget("number", k, Number(spec.default), null, {property: k});
+        w.label = label;
+        if(spec.options && spec.options.length > 1)
+          w.options = {min: Math.min(...spec.options), max: Math.max(...spec.options)};
+      } else {
+        const w = this.addWidget("text", k, String(spec.default ?? ""), null, {property: k});
+        w.label = label;
+        if(spec.type === "path"){
+          // 照旧模型节点的做法（用户批注 A4/B1）：节点上只显示文件名，
+          // 完整路径存 properties（长路径在节点控件里必然溢出）
+          w.value = _base(this.properties[k]) || "";
+          // folder 型参数选目录（ToC1），其余选文件；按钮显示文本=第二参 name
+          const action = spec.folder ? "pick_param_folder" : "pick_param_file";
+          this.addWidget("button", "浏览…", null, function(_v, _w, node){
+            if(node) act(action, {node_id: node.id, key: k});
+          });
+        }
+      }
+    }
+  }
+  SchemaNode.title = def.title || def.name;
+  SchemaNode.title_color = PORT_COLORS_GROUP[def.category] || "#0ea5e9";
+  SchemaNode.title_text_color = "#ffffff";
+  // 类型化端口连线校验：类型不匹配直接拒绝（双保险的前端那一道；
+  // 端口级 accepts=额外允许接入的源类型，与执行器同一口径）
+  SchemaNode.prototype.onConnectInput = function(target_slot, type, output, output_node, output_slot){
+    const outType = (output_node.outputs[output_slot] || {}).type;
+    const defIn = SCHEMA[this.type] && SCHEMA[this.type].inputs[target_slot];
+    const accepts = (defIn && defIn.accepts) || [];
+    if(type && outType && type !== outType && !accepts.includes(outType)){
+      const name = t => PORT_DESC[t] || t;
+      setStatus("连线被拒绝：端口类型不匹配（" + name(outType) + " → " + name(type) + "）");
+      return false;
+    }
+    return true;
+  };
+  // 载入流程文件时把 properties 同步回画布控件（w.name=参数键，可直查）。
+  // 按【属性值】的类型还原控件值——widgets_values 会因「浏览…」按钮
+  // 错位（按钮占一个槽），不可信；path 参数控件只显示文件名（同旧节点）
+  function schemaConfigure(){
+    for(const w of (this.widgets || [])){
+      const v = this.properties[w.name];
+      if(v === undefined) continue;
+      if(typeof v === "boolean") w.value = v;
+      else if(typeof v === "number") w.value = Number(v);
+      else if(SCHEMA[this.type] && SCHEMA[this.type].params[w.name] &&
+              SCHEMA[this.type].params[w.name].type === "path")
+        w.value = _base(v) || "";
+      else w.value = (v == null) ? "" : String(v);
+    }
+  }
+  // 结果合并：连上一对（图像, 结果）后自动出现下一对空输入；断开缩回。
+  // 只从尾部裁剪/回补未连线的端口——槽位序号不变，既有连线不受影响。
+  // onAdded（修复循环 4，用户批注 image-6：生成时 8 对全显）：从节点库新建
+  // 落图即裁剪到 1 对——此前只在连线变化/载入时触发，新建节点全量显示。
+  if(def.name === "merge_results"){
+    SchemaNode.prototype.onAdded = function(){
+      const n = this;
+      setTimeout(() => mergeTrimPairs(n), 0);
+    };
+    SchemaNode.prototype.onConnectionsChange = function(){
+      const n = this;
+      setTimeout(() => mergeTrimPairs(n), 0);
+    };
+    SchemaNode.prototype.onConfigure = function(){
+      schemaConfigure.call(this);
+      const n = this;
+      setTimeout(() => mergeTrimPairs(n), 0);
+    };
+  } else {
+    SchemaNode.prototype.onConfigure = schemaConfigure;
+  }
+  LiteGraph.registerNodeType(type, SchemaNode);
+}
+// 结果合并的成对输入自动增减（用户批注 image-2/3：连上一对出现下一对空输入）
+function mergeTrimPairs(node){
+  const def = SCHEMA[node.type];
+  if(!def || !node.inputs) return;
+  const pairCount = def.inputs.length / 2;
+  let want = 1;
+  for(let k = 1; k <= pairCount; k++){
+    const a = node.inputs[(k - 1) * 2], b = node.inputs[(k - 1) * 2 + 1];
+    if((a && a.link != null) || (b && b.link != null)) want = Math.min(k + 1, pairCount);
+  }
+  want = Math.max(want, 1) * 2;   // 可见输入槽数
+  for(let i = node.inputs.length - 1; i >= want; i--){
+    if(node.inputs[i].link == null) node.removeInput(i);
+  }
+  for(let i = node.inputs.length; i < want; i++){
+    const p = def.inputs[i];
+    node.addInput(p.label || p.name, p.type);
+  }
+  node.setDirtyCanvas(true, true);
+}
+// 分组标题条颜色（区分 AI / 传统，与旧节点配色同风格）
+const PORT_COLORS_GROUP = {"AI": "#7c3aed", "预处理": "#059669", "定位": "#0d9488",
+                           "逻辑": "#475569", "检出过滤": "#6366f1", "图像源": "#3b82f6",
+                           "输出": "#0284c7", "测量": "#b45309", "自定义": "#db2777"};
+
+function syncModelWidget(node){
+  for(const w of (node.widgets || []))
+    if(w.name === "model_file") w.value = _base(node.properties.model_file) || "（未选择）";
+}
+function syncNodeWidget(node, name){
+  for(const w of (node.widgets || []))
+    if(w.name === name){
+      const v = node.properties[name];
+      // path 参数控件只显示文件名（同旧模型节点，长路径必然溢出）
+      const isPath = SCHEMA[node.type] && SCHEMA[node.type].params[name] &&
+                     SCHEMA[node.type].params[name].type === "path";
+      w.value = isPath ? (_base(v) || "") : v;
+    }
+}
+
+// ================= 鼠标样式：拖动节点/平移=抓手，端口/连线=十字准星 =================
+// 注意：getSlotInPosition 是 LGraphNode 的方法且需要图坐标（此前在 canvas
+// 实例上调用并传画布坐标，每次移动都抛 TypeError，样式切换整体失效）。
+// 同时监听 pointermove+mousemove：LiteGraph 用 mousemove（pointerevents_method
+// ="mouse"）会在自身处理器里覆写光标，必须保证同类事件中本处理器最后执行。
+function _slotUnderMouse(graphX, graphY){
+  for(const n of graph._nodes)
+    if(n.getSlotInPosition(graphX, graphY)) return n;
+  return null;
+}
+function applyCursor(ev){
+  const rect = canvas.canvas.getBoundingClientRect();
+  if(ev.clientX < rect.left || ev.clientX > rect.right ||
+     ev.clientY < rect.top || ev.clientY > rect.bottom) return;
+  const p = canvas.convertCanvasToOffset([ev.clientX - rect.left, ev.clientY - rect.top]);
+  let cur = "";
+  if(canvas.node_dragged || canvas.resizing_node) cur = "grabbing"; // 拖动节点/调整尺寸中
+  else {
+    const hov = graph.getNodeOnPos(p[0], p[1]);
+    if(hov){
+      // 右下角 8px（图坐标）为尺寸调整把手
+      if(p[0] > hov.pos[0] + hov.size[0] - 8 && p[1] > hov.pos[1] + hov.size[1] - 8)
+        cur = "se-resize";
+      else if(_slotUnderMouse(p[0], p[1])) cur = "crosshair";  // 端口：连线
+      else if(canvas.over_link_center) cur = "crosshair";      // 连线中点
+      else cur = "grab";                                       // 节点主体：拖动
+    } else if(canvas.over_link_center) cur = "crosshair";      // 连线中点
+    else if(canvas.dragging_canvas) cur = "grabbing";          // 平移画布中
+  }
+  canvas.canvas.style.cursor = cur;
+}
+window.addEventListener("pointermove", applyCursor);
+window.addEventListener("mousemove", applyCursor);
+
+// ================= 属性面板（右键节点显示/可编辑，再次右键关闭） =================
+let insNode = null;
+function propInput(node, k, value){
+  const defNum = typeof (DEFS[node.type].params[k] ?? 0) === "number";
+  const input = document.createElement("input");
+  if(defNum){ input.type = "number"; input.step = "any"; }
+  input.value = value;
+  input.onchange = () => {
+    let v = input.value;
+    if(defNum){ const num = parseFloat(v); if(isNaN(num)) return; v = num; }
+    node.properties[k] = v;
+    syncNodeWidget(node, k);
+    graph.setDirtyCanvas(true, true);
+  };
+  return input;
+}
+function showInspector(node){
+  if(node.type.startsWith("xccv2/")){ showSchemaInspector(node); return; }
+  insNode = node;
+  const box = document.getElementById("inspector");
+  document.getElementById("ins-title").textContent = DEFS[node.type].title;
+  document.getElementById("ins-sub").textContent = "类型: " + node.type + "　id: " + node.id;
+  const body = document.getElementById("ins-body");
+  body.innerHTML = "";
+  const props = node.properties || {};
+  const keys = Object.keys(props);
+  if(!keys.length){
+    const d = document.createElement("div"); d.className = "hint";
+    d.textContent = "（该节点无参数）"; body.appendChild(d);
+  }
+  for(const k of keys){
+    const row = document.createElement("div"); row.className = "row";
+    const kEl = document.createElement("div"); kEl.className = "k"; kEl.textContent = k;
+    row.appendChild(kEl);
+    if(k === "model_file"){
+      const vEl = document.createElement("div"); vEl.className = "v";
+      vEl.textContent = props[k] || "（未选择，点击下方按钮选择）";
+      row.appendChild(vEl);
+      const b = document.createElement("button"); b.className = "accent";
+      b.textContent = "选择模型文件…";
+      b.onclick = () => act("pick_model", {node_id: node.id});
+      row.appendChild(b);
+    } else if(k === "regions"){
+      rpRegionsRow(row, node, k,
+          "多区域以 ; 分隔：x1,y1,x2,y2（矩形）／circle:cx,cy,r（圆）／polygon:x1,y1,x2,y2,x3,y3…（多边形）；数值 >1 为像素，否则 0~1 归一化");
+    } else {
+      row.appendChild(propInput(node, k, props[k]));
+    }
+    body.appendChild(row);
+  }
+  box.style.display = "block";
+}
+function hideInspector(){
+  insNode = null;
+  document.getElementById("inspector").style.display = "none";
+}
+function toggleInspector(node){
+  if(insNode && insNode.id === node.id &&
+     document.getElementById("inspector").style.display === "block") hideInspector();
+  else showInspector(node);
+}
+// ================= schema 属性面板（新算子：中文标签 + 按型渲染 + 快照） =================
+function showSchemaInspector(node){
+  insNode = node;
+  const def = SCHEMA[node.type];
+  const box = document.getElementById("inspector");
+  document.getElementById("ins-title").textContent = def.name;
+  document.getElementById("ins-sub").textContent =
+      (def.desc || "") + "　｜　分类: " + def.category + "　id: " + node.id;
+  const body = document.getElementById("ins-body");
+  body.innerHTML = "";
+  if(RUN_ERRORS[node.id])
+    _insHint(body, "⚠ 上次运行失败：" + RUN_ERRORS[node.id], "#dc2626");
+  for(const [k, spec] of Object.entries(def.params)){
+    const row = document.createElement("div"); row.className = "row";
+    const kEl = document.createElement("div"); kEl.className = "k";
+    kEl.textContent = spec.label;
+    kEl.title = spec.tooltip || "";   // 悬停显示人话提示
+    row.appendChild(kEl);
+    const cur = node.properties[k];
+    if(spec.type === "bool"){
+      const input = document.createElement("select");
+      input.innerHTML = '<option value="false">否</option><option value="true">是</option>';
+      input.value = String(!!cur);
+      input.className = "ins-ctl";
+      input.onchange = () => { node.properties[k] = input.value === "true";
+                               syncNodeWidget(node, k); };
+      row.appendChild(input);
+    } else if(spec.type === "enum"){
+      const input = document.createElement("select");
+      for(const o of (spec.options || [])){
+        const op = document.createElement("option");
+        op.value = String(o); op.textContent = String(o); input.appendChild(op);
+      }
+      input.value = String(cur);
+      input.className = "ins-ctl";
+      input.onchange = () => {
+        const raw = (spec.options || [])[input.selectedIndex];
+        node.properties[k] = raw;
+        syncNodeWidget(node, k);
+      };
+      row.appendChild(input);
+    } else if(spec.type === "path"){
+      const input = document.createElement("input"); input.type = "text";
+      input.value = cur == null ? "" : String(cur);
+      input.onchange = () => { node.properties[k] = input.value;
+                               syncNodeWidget(node, k); };
+      input.className = "ins-ctl";
+      row.appendChild(input);
+      const b = document.createElement("button"); b.className = "accent";
+      b.textContent = "浏览…";
+      const action = spec.folder ? "pick_param_folder" : "pick_param_file";
+      b.onclick = () => act(action, {node_id: node.id, key: k});
+      row.appendChild(b);
+    } else if(spec.type === "text" && k === "regions"){   // 区域参数：文本 + 图上绘制（F2-1）
+      rpRegionsRow(row, node, k, spec.tooltip || "");
+      body.appendChild(row);
+      continue;
+    } else if(spec.type === "text"){
+      const input = document.createElement("textarea");
+      input.value = cur == null ? "" : String(cur);
+      input.onchange = () => { node.properties[k] = input.value;
+                               syncNodeWidget(node, k); };
+      row.appendChild(input);
+    } else {   // int / float
+      const input = document.createElement("input");
+      input.type = "number"; input.step = "any";
+      if(spec.range) input.placeholder = spec.range[0] + " ~ " + spec.range[1];
+      input.value = cur == null ? "" : String(cur);
+      input.onchange = () => {
+        const num = parseFloat(input.value);
+        if(isNaN(num)) return;
+        node.properties[k] = (spec.type === "int") ? Math.round(num) : num;
+        syncNodeWidget(node, k);
+      };
+      input.className = "ins-ctl";
+      row.appendChild(input);
+    }
+    if(spec.tooltip){
+      const h = document.createElement("div"); h.className = "hint";
+      h.textContent = spec.tooltip;
+      row.appendChild(h);
+    }
+    body.appendChild(row);
+  }
+  // 运行控制：运行到此节点 / 单节点重跑
+  const ops = document.createElement("div"); ops.className = "row";
+  ops.style.display = "flex"; ops.style.gap = "6px";
+  const bRun = document.createElement("button"); bRun.className = "accent";
+  bRun.textContent = "运行到此节点";
+  bRun.onclick = () => act("run_to_node", {flow: serialize(), node_id: node.id});
+  const bRe = document.createElement("button");
+  bRe.textContent = "重跑此节点";
+  bRe.onclick = () => act("rerun_node", {node_id: node.id});
+  ops.appendChild(bRun); ops.appendChild(bRe);
+  body.appendChild(ops);
+  // 快照查看器：输入/输出图 + 几何要素
+  const snap = document.createElement("div"); snap.className = "row";
+  snap.innerHTML = '<div class="k">调试快照（运行后自动生成）</div>' +
+                   '<div id="ins-snap" class="hint">（尚未运行或该节点无图像输出）</div>';
+  body.appendChild(snap);
+  act("get_snapshot", {node_id: node.id});
+  box.style.display = "block";
+}
+function _insHint(body, text, color){
+  const d = document.createElement("div"); d.className = "hint";
+  d.style.color = color || "#94a3b8"; d.textContent = text;
+  body.appendChild(d);
+}
+function renderSnapshots(images){
+  const host = document.getElementById("ins-snap");
+  if(!host) return;
+  host.innerHTML = "";
+  host.className = "";
+  const names = Object.keys(images || {});
+  if(!names.length){
+    host.className = "hint";
+    host.textContent = "（尚未运行或该节点无图像输出）";
+    return;
+  }
+  for(const name of names){
+    const cap = document.createElement("div"); cap.className = "k";
+    cap.textContent = name;
+    const img = document.createElement("img");
+    img.src = images[name];
+    img.style.cssText = "max-width:100%;border:1px solid #e2e8f0;border-radius:6px;margin:2px 0";
+    host.appendChild(cap); host.appendChild(img);
+  }
+}
+// 右键：节点 → 切换属性面板；空白 → 不弹任何菜单
+canvas.processContextMenu = function(node, event){
+  if(node){ this.selectNodes([node]); toggleInspector(node); }
+};
+
+// ================= 序列化（格式与既有 .json/.xvap 一致） =================
+function serialize(){
+  const d = graph.serialize();
+  // 直接透传 litegraph 节点信息（含 inputs/outputs/size）：端口挂接缺失会导致
+  // configure 后画布不渲染连线（链接对象在、端口未接）
+  // schema=3：修复循环 4 起的端口布局代数（取消 image_list 端口、删 list_pick；
+  // 载入侧按标记跳过旧布局迁移）
+  return {last_node_id: d.last_node_id, last_link_id: d.last_link_id,
+          schema: 3, nodes: d.nodes, links: d.links};
+}
+const _portsOf = t => {
+  const hasIn = t !== "xccv/input_image", hasOut = t !== "xccv/output";
+  return {
+    inputs: hasIn ? [{name: "图像", type: "image", link: null}] : [],
+    outputs: hasOut ? [{name: "图像", type: "image", links: []}] : []
+  };
+};
+function loadFlow(flow){
+  // 防线（用户实测红色 undefined 节点）：图里含尚未注册的 xccv2 类型时
+  // （节点库事件晚于 loaded 到达的竞态），先缓存流程并请求节点库，
+  // 库到位后（applyNodeLibrary）自动重新载入
+  const unregistered = (flow.nodes || []).some(n =>
+      String(n.type).startsWith("xccv2/") &&
+      !LiteGraph.registered_node_types[String(n.type)]);
+  if(unregistered){
+    _pendingFlow = flow;
+    act("get_node_library");
+    setStatus("算子库载入中，流程将自动重新打开…");
+    return;
+  }
+  _pendingFlow = null;
+  // 计算缺失的 id 上限（旧文件兜底）
+  if(!flow.last_node_id) flow.last_node_id = Math.max(0, ...(flow.nodes || []).map(n => n.id || 0)) + 1;
+  if(!flow.last_link_id) flow.last_link_id = Math.max(0, ...(flow.links || []).map(l => l[0] || 0)) + 1;
+  // 旧格式节点无 inputs/outputs：按端口签名补齐，并把连线挂到端口上，
+  // 否则 configure 后画布不渲染连线
+  const byId = new Map((flow.nodes || []).map(n => [n.id, n]));
+  for(const n of (flow.nodes || [])){
+    if(!n.inputs) n.inputs = _portsOf(n.type).inputs;
+    if(!n.outputs) n.outputs = _portsOf(n.type).outputs;
+  }
+  // 修复循环 3：序列化里的端口数组可能是旧布局缓存——xccv2 节点统一按当前
+  // SCHEMA 重建（连线已由 Python 侧迁移到当前槽位；越界连线丢弃）
+  for(const n of (flow.nodes || [])){
+    const def = SCHEMA[n.type];
+    if(!def) continue;
+    const ins = def.inputs.map(p => ({name: p.label || p.name, type: p.type, link: null}));
+    const outs = def.outputs.map(p => ({name: p.label || p.name, type: p.type, links: []}));
+    for(const lk of (flow.links || [])){
+      const lid = lk[0], src = lk[1], sslot = lk[2], dst = lk[3], dslot = lk[4];
+      if(n.id === dst && ins[dslot]) ins[dslot].link = lid;
+      if(n.id === src && outs[sslot]){
+        outs[sslot].links = outs[sslot].links || [];
+        outs[sslot].links.push(lid);
+      }
+    }
+    n.inputs = ins;
+    n.outputs = outs;
+  }
+  for(const lk of (flow.links || [])){
+    const lid = lk[0], src = lk[1], sslot = lk[2], dst = lk[3], dslot = lk[4];
+    const sn = byId.get(src), tn = byId.get(dst);
+    if(!sn || !tn) continue;
+    const out = (sn.outputs || [])[sslot] || (sn.outputs || [])[0];
+    const inp = (tn.inputs || [])[dslot] || (tn.inputs || [])[0];
+    if(out){ out.links = out.links || []; if(!out.links.includes(lid)) out.links.push(lid); }
+    if(inp){ inp.link = lid; }
+  }
+  graph.configure(flow);
+  for(const n of graph._nodes) if(n.onConfigure) n.onConfigure();
+  // 节点尺寸归一化（用户批注 B4/C2：退化 size 的节点渲染显示异常）：
+  // 过窄/未计算的 size 用 computeSize 重算；新算子节点最小宽度 190，
+  // 中文标签与路径文本才显示得全（坑 34 同族）
+  for(const n of graph._nodes){
+    if(!n.size || n.size[0] < 60 || n.size[1] < 20) n.size = n.computeSize();
+    if(String(n.type).startsWith("xccv2/") && n.size[0] < 190)
+      n.size[0] = 190;
+  }
+  updateCount();
+  fitView();
+}
+function updateCount(){
+  document.getElementById("nodecount").textContent = "节点 " + graph._nodes.length;
+}
+graph.onNodeAdded = graph.onNodeRemoved = updateCount;
+
+function saveJson(){ act("save_json", {flow: serialize()}); }
+function hasNewNodes(){
+  return graph._nodes.some(n => String(n.type).startsWith("xccv2/"));
+}
+function runPreview(){
+  const sel = canvas.selected_nodes ? Object.values(canvas.selected_nodes)[0] : null;
+  if(hasNewNodes()){
+    // 含新算子：走新引擎（运行到此节点/全图），节点级日志与快照随会话返回
+    act("run_to_node", {flow: serialize(), node_id: sel ? sel.id : null});
+  } else {
+    // 纯旧版流程文件：走旧链运行预览（新流程不产生此形态）
+    act("run_preview", {flow: serialize(), node_id: sel ? sel.id : null});
+  }
+}
+function fitView(){
+  // 适配画布：视口对准所有节点的包围盒并居中（打开文件后节点可能在
+  // 任意坐标——此前只复位原点，节点在视口外时用户看到的是"空白画布"）
+  const nodes = graph._nodes;
+  if(!nodes || !nodes.length){
+    canvas.ds.scale = 1; canvas.ds.offset = [0, 0];
+    canvas.setDirty(true, true);
+    return;
+  }
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for(const n of nodes){
+    x0 = Math.min(x0, n.pos[0]); y0 = Math.min(y0, n.pos[1]);
+    x1 = Math.max(x1, n.pos[0] + (n.size ? n.size[0] : 100));
+    y1 = Math.max(y1, n.pos[1] + (n.size ? n.size[1] : 60));
+  }
+  const box = document.getElementById("canvasbox");
+  const vw = Math.max(200, box.clientWidth - 40);
+  const vh = Math.max(160, box.clientHeight - 40);
+  const scale = Math.min(1, Math.min(vw / (x1 - x0 + 80), vh / (y1 - y0 + 80)));
+  canvas.ds.scale = scale;
+  canvas.ds.offset = [-x0 * scale + (vw - (x1 - x0) * scale) / 2 + 20,
+                      -y0 * scale + (vh - (y1 - y0) * scale) / 2 + 20];
+  canvas.setDirty(true, true);
+}
+
+// ================= 节点库：按住拖到画布落点（中心对齐）；轻点=显示功能说明 =================
+function addNodeAt(type, graphX, graphY){
+  const node = LiteGraph.createNode(type);
+  graph.add(node);                       // 先入图，size 才会被计算
+  node.pos = [Math.round(graphX - node.size[0] / 2),
+              Math.round(graphY - node.size[1] / 2)];  // 节点中心对齐落点
+  if(String(type).startsWith("xccv2/") && node.size[0] < 190)
+    node.size[0] = 190;                  // 新算子节点加宽：中文标签/路径显示全
+  return node;
+}
+// 各节点功能说明（轻点节点库项时显示/取消）
+const DESC = {
+  "xccv/input_image":        "提供流程的输入图像，作为后续节点的处理数据源",
+  "xccv/model_detection":    "加载目标检测模型，输出图中目标的边界框与类别",
+  "xccv/model_instance_seg": "加载实例分割模型，输出目标边界框与像素级掩码",
+  "xccv/model_classification": "加载分类模型，输出整图类别与置信度",
+  "xccv/post_confidence":    "过滤置信度低于下限的检出",
+  "xccv/post_class_filter":  "只保留 keep 中列出的类别（多个用逗号分隔，留空=全部保留）",
+  "xccv/post_bbox_size":     "按边界框宽/高范围过滤（0 表示不限制，单位像素）",
+  "xccv/post_bbox_area":     "按边界框面积（宽×高）范围过滤（0 表示不限制）",
+  "xccv/post_mask_area":     "按掩码像素面积过滤（实例分割；0 表示不限制）",
+  "xccv/post_region_block":  "屏蔽区域内的目标被过滤；区域可在属性面板\"图上框选\"",
+  "xccv/post_region_keep":   "仅保留区域内的目标，多个区域取并集",
+  "xccv/post_count_check":   "对过滤后数量做上下限判定，超限在结果中标记 NG",
+  "xccv/output":             "输出流程的最终过滤结果",
+};
+let descShownType = null;
+function titleOf(type){
+  if(type.startsWith("xccv2/"))
+    return (SCHEMA[type] && SCHEMA[type].title) || type.slice(6);
+  return DEFS[type].title;
+}
+function descOf(type){
+  if(type.startsWith("xccv2/")){
+    const d = SCHEMA[type] || {};
+    return d.desc || "（暂无说明）";
+  }
+  return DESC[type] || "";
+}
+function toggleDesc(type){
+  const box = document.getElementById("palette-desc");
+  if(descShownType === type){ descShownType = null; box.style.display = "none"; return; }
+  descShownType = type;
+  box.innerHTML = '<b>' + titleOf(type) + '</b>：' + descOf(type) +
+      '<div style="margin-top:3px;color:#94a3b8">再点一次该项可收起</div>';
+  box.style.display = "block";
+}
+function paletteDrag(ev, type){
+  ev.preventDefault();
+  const item = ev.currentTarget;
+  item.classList.add("is-dragging");
+  const startX = ev.clientX, startY = ev.clientY;
+  let moved = false;
+  // 虚化节点预览：中心跟随光标的半透明迷你节点（与实际创建位置对齐）
+  const ghost = document.createElement("div");
+  ghost.textContent = titleOf(type);
+  ghost.style.cssText = "position:fixed;z-index:99;pointer-events:none;" +
+      "width:150px;padding:6px 10px;text-align:center;font-size:13px;" +
+      "background:rgba(47,149,179,.35);border:1.5px dashed #2f95b3;border-radius:8px;" +
+      "color:#0f172a;font-family:'Microsoft YaHei',sans-serif;transform:translate(-50%,-50%)";
+  document.body.appendChild(ghost);
+  const place = e => { ghost.style.left = e.clientX + "px"; ghost.style.top = e.clientY + "px"; };
+  place(ev);
+  const onMove = e => {
+    place(e);
+    if(Math.abs(e.clientX - startX) + Math.abs(e.clientY - startY) > 4) moved = true;
+  };
+  const onUp = e => {
+    ghost.remove();
+    item.classList.remove("is-dragging");
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    const rect = canvas.canvas.getBoundingClientRect();
+    const inside = e.clientX >= rect.left && e.clientX <= rect.right &&
+                   e.clientY >= rect.top && e.clientY <= rect.bottom;
+    if(inside){
+      // 屏幕坐标 → 图坐标（LiteGraph 视图变换），节点中心=松手点
+      const p = canvas.convertCanvasToOffset(
+          [e.clientX - rect.left, e.clientY - rect.top]);
+      addNodeAt(type, p[0], p[1]);
+    } else if(!moved){
+      toggleDesc(type);  // 轻点：显示/取消功能说明
+    }
+  };
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+}
+// 节点库页签（用户批注 Q5 重构）：AI 算子 / 传统算子 / 通用算子——
+// 检出过滤与逻辑类算子是 AI、传统两条链共用的，归「通用」页签；
+// 旧版画布节点（xccv/ 前缀）不再进面板（测试阶段舍弃旧流程文件兼容，
+// 类型仍注册以便旧文件能打开查看），新流程一律使用 xccv2/ 节点
+let paletteTab = "ai";
+function switchTab(tab){
+  paletteTab = tab;
+  for (const t of ["ai", "common"]) {
+    const el = document.getElementById("tab-" + t);
+    if (el) el.classList.toggle("active", tab === t);
+  }
+  buildPalette(document.getElementById("search-box").value.trim());
+}
+const TAB_SECTIONS = {
+  ai: [
+    {title: "模型（AI）", schema: ["AI"]},
+    {title: "图像源", schema: ["图像源"]},
+  ],
+  common: [
+    {title: "裁图与合并", schema: ["通用"]},
+    {title: "检出过滤", schema: ["检出过滤"]},
+    {title: "逻辑运算", schema: ["逻辑"]},
+    {title: "输出", schema: ["输出"]},
+    {title: "自定义算子", schema: ["自定义"]},
+    {title: "测量与判定", schema: ["测量"]},
+  ],
+};
+function buildPalette(filter){
+  const host = document.getElementById("palette-groups");
+  host.innerHTML = "";
+  const match = (t, label) => !filter || label.includes(filter) || t.includes(filter);
+  for(const sec of TAB_SECTIONS[paletteTab] || []){
+    const frag = document.createElement("div");
+    for(const cat of sec.schema){
+      const items = Object.entries(SCHEMA).filter(([t, d]) =>
+          d.category === cat && match(t, (d.title || d.name) + (d.desc || "")));
+      if(!items.length) continue;
+      if(!frag.querySelector("h3")){ const h = document.createElement("h3");
+        h.textContent = sec.title; frag.appendChild(h); }
+      const sub = document.createElement("div"); sub.className = "subcat";
+      sub.textContent = cat; frag.appendChild(sub);
+      for(const [type, d] of items)
+        frag.appendChild(_paletteItem(type, d.title || d.name));
+    }
+    if(frag.childNodes.length) host.appendChild(frag);
+  }
+  if(!host.childNodes.length){
+    const d = document.createElement("div"); d.className = "subcat";
+    d.textContent = "（无匹配算子）"; host.appendChild(d);
+  }
+}
+function _paletteItem(type, label){
+  const it = document.createElement("div");
+  it.className = "item"; it.textContent = label;
+  it.addEventListener("pointerdown", ev => paletteDrag(ev, type));
+  return it;
+}
+document.getElementById("search-box").addEventListener("input",
+    ev => buildPalette(ev.target.value.trim()));
+buildPalette("");
+
+// ================= 区域绘制（属性面板内嵌 + 放大编辑；矩形/圆/多边形） =================
+// 坐标以图片自然尺寸的【像素】存储/写回（圆、多边形加前缀；矩形不带前缀，
+// 与旧 regions 串逐位兼容；后端 flow.regions 兼容像素与 0~1 归一化，>1 按像素）。
+// 未识别条目原样保留（regions 串可能含手写/程序生成的任意内容，绝不丢弃）。
+let rpState = null;
+// {nodeId, path, dataUrl, tool:"rect"|"circle"|"polygon", sel, items:[rpItem], lost:[str]}
+// rpItem: {shape, geo, str}；geo=像素坐标对象（rect/circle/polygon 各异），str=写回串
+function rpEntryStr(entry){ return entry == null ? "" : String(entry).trim(); }
+function rpNums(text){
+  const t = rpEntryStr(text).replace(/，/g, ",");
+  const m = t.replace(/^(rect|circle|polygon)\s*:/i, "");
+  const nums = m.split(",").map(Number).filter(v => !isNaN(v));
+  const hasPrefix = /^(rect|circle|polygon)\s*:/i.test(t);
+  return {nums: nums, hasPrefix: hasPrefix};
+}
+function rpClassify(entry){
+  // → {ok:bool, shape, geo, str}；ok=false 表示未知条目（原样保留）
+  const t = rpEntryStr(entry);
+  if(!t) return null;
+  const low = t.toLowerCase();
+  const {nums, hasPrefix} = rpNums(t);
+  const all = nums.length > 0 && nums.every(Number.isFinite);
+  const fmt = a => a.map(v => +(+v).toFixed(1)).join(",");
+  if(hasPrefix || (all && !hasPrefix && nums.length === 4)){
+    const shape = hasPrefix ? low.replace(/\s*:.*$/, "") : "rect";
+    if(shape === "rect" && nums.length === 4)
+      return {ok: true, shape: "rect",
+              geo: {x1: nums[0], y1: nums[1], x2: nums[2], y2: nums[3]},
+              str: fmt(nums)};   // 矩形不带前缀（旧串兼容）
+    if(shape === "circle" && nums.length === 3)
+      return {ok: true, shape: "circle", geo: {cx: nums[0], cy: nums[1], r: nums[2]},
+              str: "circle:" + fmt(nums)};
+    if(shape === "polygon" && nums.length >= 6 && nums.length % 2 === 0)
+      return {ok: true, shape: "polygon", geo: {pts: nums},
+              str: "polygon:" + fmt(nums)};
+    return {ok: false};   // 前缀与数值个数不符：未知条目
+  }
+  return {ok: false};
+}
+function rpParseRegions(node){
+  const items = [], lost = [];
+  for(const part of rpEntryStr(node.properties.regions).split(";")){
+    const c = rpClassify(part);
+    if(c === null) continue;          // 空段
+    if(c.ok) items.push({shape: c.shape, geo: c.geo, str: c.str});
+    else lost.push(rpEntryStr(part)); // 未识别条目原样保留
+  }
+  return {items: items, lost: lost};
+}
+function rpGeoStr(shape, geo){
+  const f = v => +(+v).toFixed(1);
+  if(shape === "rect")
+    return [geo.x1, geo.y1, geo.x2, geo.y2].map(f).join(",");
+  if(shape === "circle")
+    return "circle:" + [geo.cx, geo.cy, geo.r].map(f).join(",");
+  return "polygon:" + geo.pts.map(f).join(",");
+}
+function rpItemStr(it){ return rpGeoStr(it.shape, it.geo); }
+function rpWrite(node){
+  if(!node || !rpState) return;
+  const str = rpState.items.map(rpItemStr).concat(rpState.lost).join(";");
+  node.properties.regions = str;
+  syncNodeWidget(node, "regions");
+  const ta = document.querySelector("#ins-body .rp-textarea");
+  if(ta) ta.value = str;
+  graph.setDirtyCanvas(true, true);
+}
+function rpEvent(payload){
+  const node = graph.getNodeById(payload.node_id);
+  if(!node) return;
+  const parsed = rpParseRegions(node);
+  rpState = {nodeId: payload.node_id, path: payload.path || "",
+             dataUrl: payload.data_url || "", tool: "rect", sel: -1,
+             items: parsed.items, lost: parsed.lost};
+  showInspector(node);
+  setStatus(payload.path ? "已载入绘制底图 " + _base(payload.path)
+                         : "已载入绘制底图");
+}
+function rpRegionsRow(row, node, key, tip){
+  const input = document.createElement("textarea");
+  input.className = "rp-textarea";
+  input.value = rpEntryStr(node.properties[key]);
+  input.onchange = () => { node.properties[key] = input.value;
+                           syncNodeWidget(node, key); };
+  row.appendChild(input);
+  const b = document.createElement("button");
+  b.textContent = "图上绘制区域…";
+  b.onclick = () => act("pick_image", {node_id: node.id});
+  row.appendChild(b);
+  const h = document.createElement("div"); h.className = "hint";
+  h.textContent = (tip || "格式 x1,y1,x2,y2;…（>1 按像素）") + "；下方可在图上直接绘制";
+  row.appendChild(h);
+  const box = document.createElement("div");
+  box.className = "rp-box";
+  row.appendChild(box);
+  queueMicrotask(() => rpMount(box, false));
+}
+function rpOpenBig(){
+  if(!rpState) return;
+  const m = document.getElementById("rp-modal");
+  m.style.display = "flex";
+  rpMount(m.querySelector(".rp-box"), true);
+}
+function rpCloseBig(){
+  const m = document.getElementById("rp-modal");
+  m.style.display = "none";
+  m.querySelector(".rp-box").innerHTML = "";
+  if(rpState && insNode && insNode.id === rpState.nodeId) showInspector(insNode);
+}
+function rpScale(img){
+  // 显示→自然像素比例（getBoundingClientRect 强制同步布局，避免取到 0）
+  const r = img.getBoundingClientRect();
+  const nw = img.naturalWidth || r.width || 1;
+  const nh = img.naturalHeight || r.height || 1;
+  return {sx: r.width / nw, sy: r.height / nh, nw: nw, nh: nh};
+}
+function rpSvgEl(tag, attrs){
+  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for(const k of Object.keys(attrs || {})) el.setAttribute(k, attrs[k]);
+  return el;
+}
+function rpShapeEls(it, idx){
+  // 单条区域 → SVG 形状元素列表（自然像素坐标系；选中加 .sel，多边形带序号标签）
+  const els = [], g = it.geo, cls = "rp-shape" + (idx === rpState.sel ? " sel" : "");
+  const common = {"class": cls, "data-idx": idx};
+  if(it.shape === "rect"){
+    const x = Math.min(g.x1, g.x2), y = Math.min(g.y1, g.y2);
+    els.push(rpSvgEl("rect", Object.assign(common, {
+        x: x, y: y, width: Math.abs(g.x2 - g.x1), height: Math.abs(g.y2 - g.y1)})));
+  } else if(it.shape === "circle"){
+    els.push(rpSvgEl("circle", Object.assign(common,
+        {cx: g.cx, cy: g.cy, r: Math.max(1, g.r)})));
+  } else {
+    const pts = [];
+    for(let i = 0; i < g.pts.length; i += 2) pts.push(g.pts[i] + "," + g.pts[i + 1]);
+    els.push(rpSvgEl("polygon", Object.assign(common, {points: pts.join(" ")})));
+    for(let i = 0, j = 0; i < g.pts.length; i += 2, j++){
+      const v = rpSvgEl("circle", {class: "rp-v" + (j === 0 ? " first" : ""),
+          cx: g.pts[i], cy: g.pts[i + 1], r: Math.max(3, 4 / rpState.zoom)});
+      els.push(v);
+    }
+    const lx = g.pts[0], ly = g.pts[1] - Math.max(8, 12 / rpState.zoom);
+    const lbl = rpSvgEl("text", {class: "rp-lbl", x: lx, y: ly,
+        "font-size": Math.max(10, 11 / rpState.zoom), "text-anchor": "middle"});
+    lbl.textContent = String(idx + 1);
+    els.push(lbl);
+  }
+  return els;
+}
+function rpRender(){
+  // 优先渲染"当前可见"的容器：放大编辑打开时画在弹层，否则画在属性面板
+  // （两个 .rp-box 都常驻 DOM，querySelector 顺序不能决定可见性）
+  const modal = document.getElementById("rp-modal");
+  const box = (modal && modal.style.display === "flex")
+      ? modal.querySelector(".rp-box")
+      : document.querySelector("#ins-body .rp-box");
+  if(!box || !rpState) return;
+  const img = box.querySelector("img.rp-img");
+  const svg = box.querySelector("svg.rp-svg");
+  if(!img || !img.naturalWidth) return;   // 底图未就绪
+  const {sx, sy} = rpScale(img);
+  rpState.zoom = Math.max(sx, sy);
+  svg.setAttribute("width", img.clientWidth);
+  svg.setAttribute("height", img.clientHeight);
+  svg.setAttribute("viewBox", "0 0 " + img.naturalWidth + " " + img.naturalHeight);
+  svg.innerHTML = '<rect class="rp-bg" x="0" y="0" width="' +
+      img.naturalWidth + '" height="' + img.naturalHeight + '"/>';
+  rpState.items.forEach((it, i) => {
+    for(const el of rpShapeEls(it, i)){
+      if(el.tagName === "polygon" || el.tagName === "circle" || el.tagName === "rect"){
+        el.addEventListener("pointerdown", ev => rpItemDown(ev, i, svg, img));
+      }
+      svg.appendChild(el);
+    }
+    if(i === rpState.sel && rpState.tool !== "polygon"){   // 选中项画角点把手
+      const pts = it.shape === "rect"
+          ? [[it.geo.x1, it.geo.y1], [it.geo.x2, it.geo.y1],
+             [it.geo.x1, it.geo.y2], [it.geo.x2, it.geo.y2]]
+          : [[it.geo.cx + it.geo.r, it.geo.cy]];           // 圆：右侧半径把手
+      for(const [hx, hy] of pts){
+        const h = rpSvgEl("circle", {class: "rp-h", "data-idx": i,
+            cx: hx, cy: hy, r: Math.max(5, 6 / rpState.zoom)});
+        h.addEventListener("pointerdown", ev => rpItemDown(ev, i, svg, img, true));
+        svg.appendChild(h);
+      }
+    }
+  });
+  const read = box.querySelector(".rp-read");
+  const names = {rect: "矩形", circle: "圆", polygon: "多边形"};
+  const count = rpState.items.length +
+      (rpState.lost.length ? "（另有 " + rpState.lost.length + " 条无法识别的原样保留）" : "");
+  if(rpState.sel >= 0 && rpState.items[rpState.sel]){
+    const it = rpState.items[rpState.sel];
+    read.textContent = names[it.shape] + " " + (rpState.sel + 1) + "/" +
+        rpState.items.length + "：" + rpItemStr(it) + "（像素）";
+  } else {
+    read.textContent = "已绘制 " + count + " 个区域（当前工具：" +
+        names[rpState.tool] + "）";
+  }
+}
+function rpMount(host, big){
+  if(!host || !rpState) return;
+  const showPath = !big;
+  host.innerHTML =
+    (showPath ? '<div class="rp-pathrow"><div class="rp-path" title="' + rpState.path + '">' +
+      (rpState.path || "（尚未选择底图）") + '</div>' +
+      '<button type="button" id="rp-pick">选择文件</button></div>' : '') +
+    '<div class="rp-toolbar">' +
+      ["rect", "circle", "polygon"].map(t =>
+        '<button type="button" data-tool="' + t + '" class="' +
+        (rpState.tool === t ? "on" : "") + '">' +
+        ({rect: "矩形", circle: "圆", polygon: "多边形"}[t]) + '</button>').join("") +
+      (showPath ? '<button type="button" id="rp-big">放大编辑</button>' : '') +
+    '</div>' +
+    '<div class="rp-imgwrap"><div class="rp-imgbox" tabindex="0">' +
+      '<img class="rp-img" draggable="false" alt="绘制底图">' +
+      '<svg class="rp-svg"></svg></div></div>' +
+    '<div class="rp-read"></div>' +
+    '<div class="rp-tools">' +
+      '<button type="button" id="rp-del">删除选中</button>' +
+      '<button type="button" id="rp-clear">清空</button></div>';
+  const img = host.querySelector("img.rp-img");
+  img.onload = () => { rpRender(); requestAnimationFrame(rpRender); };  // 布局稳定后再绘一次
+  if(rpState.dataUrl) img.src = rpState.dataUrl;
+  else if(rpState.path){  // 兜底：旧版后端只回路径
+    img.src = "file:///" + String(rpState.path).replace(/\\/g, "/")
+        .replace(/^\/+/, "").replace(/#/g, "%23");
+  }
+  if(showPath)
+    host.querySelector("#rp-pick").onclick = () => act("pick_image", {node_id: rpState.nodeId});
+  const bigBtn = host.querySelector("#rp-big");
+  if(bigBtn) bigBtn.onclick = () => rpOpenBig();
+  for(const b of host.querySelectorAll(".rp-toolbar button[data-tool]"))
+    b.onclick = () => {
+      rpState.tool = b.dataset.tool;
+      rpState.sel = -1;
+      for(const x of host.querySelectorAll(".rp-toolbar button[data-tool]"))
+        x.classList.toggle("on", x === b);
+      rpRender();
+    };
+  host.querySelector("#rp-del").onclick = () => {
+    if(rpState.sel >= 0){ rpState.items.splice(rpState.sel, 1); rpState.sel = -1;
+      rpRender(); rpWrite(graph.getNodeById(rpState.nodeId)); }
+  };
+  host.querySelector("#rp-clear").onclick = () => {
+    rpState.items = []; rpState.sel = -1; rpRender();
+    rpWrite(graph.getNodeById(rpState.nodeId));
+  };
+  rpWire(host.querySelector(".rp-imgbox"), img);
+}
+function rpItemDown(ev, idx, svg, img, isHandle){
+  // 点中形状（拖动）或把手（改形）：自然像素坐标下记录手势基线
+  if(ev.button !== 0) return;   // 右键留给撤销/菜单，不触发拖动（用户批注 F2-1 复测）
+  ev.preventDefault();
+  ev.stopPropagation();
+  rpState.sel = idx;
+  const it = rpState.items[idx];
+  const base = it.shape === "rect"
+      ? [it.geo.x1, it.geo.y1, it.geo.x2, it.geo.y2]
+      : it.shape === "circle" ? [it.geo.cx, it.geo.cy, it.geo.r] : it.geo.pts.slice();
+  const g = {it: it, base: base, rect: it.shape === "rect", circ: it.shape === "circle"};
+  g.pts = it.shape === "polygon" ? it.geo.pts.slice() : null;
+  const p0 = img.getBoundingClientRect();
+  g.orig = {x: ev.clientX - p0.left, y: ev.clientY - p0.top};   // 显示像素起点
+  const s = rpScale(img);
+  g.sx = s.sx; g.sy = s.sy;
+  g.handle = isHandle ? (it.shape === "circle" ? "r" : "corner") : null;
+  rpGesture = g;
+  rpRender();
+}
+let rpGesture = null;
+function rpClient(img, ev){
+  const r = img.getBoundingClientRect();
+  return {x: ev.clientX - r.left, y: ev.clientY - r.top};
+}
+function rpWire(layer, img){
+  // 手势全程使用【自然像素】坐标（SVG viewBox 即自然像素，所见即所得）；
+  // 仅在钳位时用 rpScale 换算边界。矩形=拖出新矩形；圆=按下定圆心、拖出半径；
+  // 多边形=单击加点、双击/回车/点回首点闭合、右键/Backspace 撤点。
+  let draft = null, moving = null;
+  const dpt = ev => {
+    const {sx, sy} = rpScale(img);
+    const p = rpClient(img, ev);
+    return {x: p.x / sx, y: p.y / sy, sx: sx, sy: sy};
+  };
+  const clamp = (v, hi) => Math.min(Math.max(v, 0), Math.round(hi));
+  layer.addEventListener("pointerdown", ev => {
+    if(!rpState) return;
+    if(ev.button !== 0) return;   // 右键=撤点（contextmenu）；禁用右键建点（用户批注）
+    ev.preventDefault();
+    const p = dpt(ev);
+    if(ev.target.classList.contains("rp-shape") || ev.target.classList.contains("rp-h"))
+      return;   // 由 rpItemDown 接管（形状元素上已直接注册 pointerdown）
+    if(rpState.tool === "polygon"){
+      if(rpState.sel < 0 || !rpState.items[rpState.sel] ||
+         rpState.items[rpState.sel].shape !== "polygon"){
+        rpState.items.push({shape: "polygon", geo: {pts: []}, str: ""});
+        rpState.sel = rpState.items.length - 1;
+      }
+      const pts = rpState.items[rpState.sel].geo.pts;
+      if(pts.length >= 6){   // 点回首点 → 闭合
+        const closeR = 10 / Math.max(rpState.zoom || 1, 0.001);
+        if(Math.abs(p.x - pts[0]) <= closeR && Math.abs(p.y - pts[1]) <= closeR){
+          rpFinishPoly(rpState.items[rpState.sel]);
+          return;
+        }
+      }
+      pts.push(+p.x.toFixed(1), +p.y.toFixed(1));
+      rpRender();
+      return;
+    }
+    draft = rpSvgEl("rect", {class: "rp-draft",
+        x: p.x, y: p.y, width: 0, height: 0});
+    layer.querySelector("svg.rp-svg").appendChild(draft);
+    moving = {x0: p.x, y0: p.y, sx: p.sx, sy: p.sy};
+    rpState.sel = -1;
+    rpRender();
+  });
+  layer.addEventListener("pointermove", ev => {
+    if(draft && moving){
+      const p = dpt(ev);
+      draft.setAttribute("x", Math.min(moving.x0, p.x));
+      draft.setAttribute("y", Math.min(moving.y0, p.y));
+      draft.setAttribute("width", Math.abs(p.x - moving.x0));
+      draft.setAttribute("height", Math.abs(p.y - moving.y0));
+    }
+  });
+  const finish = ev => {
+    if(draft && moving){
+      const p = ev ? dpt(ev) : {x: moving.x0, y: moving.y0};
+      const w = Math.abs(p.x - moving.x0), h = Math.abs(p.y - moving.y0);
+      const minSz = 4 / Math.min(moving.sx, moving.sy);
+      const big = rpState.tool === "circle"
+          ? Math.hypot(w, h) > minSz : (w > minSz && h > minSz);   // 圆只看拖拽距离
+      if(big){
+        rpState.items.push({shape: rpState.tool === "circle" ? "circle" : "rect",
+            geo: rpState.tool === "circle"
+                ? {cx: +moving.x0.toFixed(1), cy: +moving.y0.toFixed(1),
+                   r: +Math.hypot(p.x - moving.x0, p.y - moving.y0).toFixed(1)}   // 圆=拖拽距离
+                : {x1: +Math.min(moving.x0, p.x).toFixed(1),
+                   y1: +Math.min(moving.y0, p.y).toFixed(1),
+                   x2: +Math.max(moving.x0, p.x).toFixed(1),
+                   y2: +Math.max(moving.y0, p.y).toFixed(1)},
+            str: ""});
+        const last = rpState.items[rpState.items.length - 1];
+        last.str = rpItemStr(last);
+        rpState.sel = rpState.items.length - 1;
+        rpWrite(graph.getNodeById(rpState.nodeId));
+      }
+      if(draft){ draft.remove(); draft = null; }
+      moving = null;
+      rpRender();
+      return;
+    }
+    if(rpGesture){ rpGesture = null; rpWrite(graph.getNodeById(rpState.nodeId)); rpRender(); }
+  };
+  layer.addEventListener("pointerup", finish);
+  layer.addEventListener("pointerleave", ev => { if(draft) finish(ev); });
+  layer.addEventListener("contextmenu", ev => {   // 右键：多边形撤点（labelme 语义）
+    ev.preventDefault();
+    if(rpState && rpState.tool === "polygon" && rpState.sel >= 0 &&
+       rpState.items[rpState.sel] && rpState.items[rpState.sel].shape === "polygon"){
+      const pts = rpState.items[rpState.sel].geo.pts;
+      if(pts.length >= 2){ pts.pop(); pts.pop(); rpRender(); }
+    }
+  });
+  // 滚轮缩放底图（用户建议）：以当前适应宽度为基准，25% 步进；
+  // 放大后容器内滚动查看，重新打开面板/弹层即复位
+  layer.addEventListener("wheel", ev => {
+    if(!rpState || !img.naturalWidth) return;
+    ev.preventDefault();
+    const box = img.parentElement;              // .rp-imgbox
+    if(rpState._fitW == null)
+      rpState._fitW = Math.max(32, img.clientWidth || img.naturalWidth);
+    rpState._zoom = Math.min(12, Math.max(0.15,
+        (rpState._zoom || 1) * (ev.deltaY < 0 ? 1.25 : 0.8)));
+    box.style.maxWidth = "none";
+    box.style.width = Math.round(rpState._fitW * rpState._zoom) + "px";
+    img.style.width = "100%";
+    img.style.maxHeight = "none";
+    rpRender();
+  }, {passive: false});
+  layer.addEventListener("dblclick", () => {
+    if(rpState && rpState.tool === "polygon" && rpState.sel >= 0 &&
+       rpState.items[rpState.sel] && rpState.items[rpState.sel].shape === "polygon")
+      rpFinishPoly(rpState.items[rpState.sel]);
+  });
+  layer.addEventListener("keydown", ev => {
+    if(ev.key === "Backspace" && rpState.tool === "polygon" && rpState.sel >= 0 &&
+       rpState.items[rpState.sel] && rpState.items[rpState.sel].shape === "polygon"){
+      ev.preventDefault();
+      const pts = rpState.items[rpState.sel].geo.pts;
+      if(pts.length >= 2){ pts.pop(); pts.pop(); rpRender(); }
+    } else if(ev.key === "Enter" && rpState.tool === "polygon" && rpState.sel >= 0){
+      rpFinishPoly(rpState.items[rpState.sel]);
+    }
+  });
+  window.addEventListener("pointermove", ev => {
+    if(!rpGesture) return;
+    const g = rpGesture;
+    const p = dpt(ev);
+    const dx = p.x - g.orig.x, dy = p.y - g.orig.y;   // 自然像素位移
+    if(g.handle === "r"){                      // 圆半径把手：半径=把手到圆心距离
+      g.it.geo.r = +Math.max(1, Math.hypot(
+          p.x - g.it.geo.cx, p.y - g.it.geo.cy)).toFixed(1);
+    } else if(g.handle === "corner" && g.rect){  // 矩形角点把手：按指针象限定对角
+      const b = g.base;
+      const cx = (b[0] + b[2]) / 2, cy = (b[1] + b[3]) / 2;
+      if(p.x < cx){ g.it.geo.x1 = +p.x.toFixed(1); g.it.geo.x2 = +b[2].toFixed(1); }
+      else { g.it.geo.x1 = +b[0].toFixed(1); g.it.geo.x2 = +p.x.toFixed(1); }
+      if(p.y < cy){ g.it.geo.y1 = +p.y.toFixed(1); g.it.geo.y2 = +b[3].toFixed(1); }
+      else { g.it.geo.y1 = +b[1].toFixed(1); g.it.geo.y2 = +p.y.toFixed(1); }
+    } else if(g.pts){                           // 多边形整体拖动
+      g.it.geo.pts = g.base.map((v, i) =>
+          +((i % 2 === 0) ? v + dx : v + dy).toFixed(1));
+    } else if(g.rect){                          // 矩形整体拖动
+      g.it.geo.x1 = +(g.base[0] + dx).toFixed(1); g.it.geo.x2 = +(g.base[2] + dx).toFixed(1);
+      g.it.geo.y1 = +(g.base[1] + dy).toFixed(1); g.it.geo.y2 = +(g.base[3] + dy).toFixed(1);
+    } else if(g.circ){                          // 圆整体拖动
+      g.it.geo.cx = +(g.base[0] + dx).toFixed(1); g.it.geo.cy = +(g.base[1] + dy).toFixed(1);
+    }
+    rpRender();
+  });
+  window.addEventListener("pointerup", () => {
+    if(!rpGesture) return;
+    const g = rpGesture; rpGesture = null;
+    if(!rpState) return;
+    const nw = img.naturalWidth, nh = img.naturalHeight;
+    const gg = g.it.geo;
+    if(g.rect){
+      gg.x1 = clamp(gg.x1, nw); gg.x2 = clamp(gg.x2, nw);
+      gg.y1 = clamp(gg.y1, nh); gg.y2 = clamp(gg.y2, nh);
+    } else if(g.circ){
+      gg.cx = clamp(gg.cx, nw); gg.cy = clamp(gg.cy, nh);
+    } else if(gg.pts){
+      gg.pts = gg.pts.map((v, i) => clamp(v, i % 2 === 0 ? nw : nh));
+    }
+    g.it.str = rpItemStr(g.it);
+    rpWrite(graph.getNodeById(rpState.nodeId));
+    rpRender();
+  });
+}
+function rpFinishPoly(item){
+  // 多边形收尾：≥3 顶点才成形；不足则丢弃该条；写回并退出绘制态
+  if(!item) return;
+  if(item.geo.pts.length >= 6){
+    item.str = rpItemStr(item);
+    rpWrite(graph.getNodeById(rpState.nodeId));
+    rpState.sel = -1;
+    rpRender();
+  } else {
+    const i = rpState.items.indexOf(item);
+    if(i >= 0) rpState.items.splice(i, 1);
+    rpState.sel = -1;
+    rpRender();
+    rpWrite(graph.getNodeById(rpState.nodeId));
+  }
+}
+(function(){  // Delete 删除选中区域；Esc 取消多边形/关闭放大编辑；Ctrl+S 保存
+  // 参数数字输入禁用滚轮调值（用户批注：滚动属性面板时误改数值）——
+  // 聚焦中的 number 输入上滚动=退出聚焦并拦下本次滚动，之后滚轮正常滚动面板
+  document.addEventListener("wheel", ev => {
+    const t = ev.target;
+    if(t && t.tagName === "INPUT" && t.type === "number" && document.activeElement === t){
+      ev.preventDefault();
+      t.blur();
+    }
+  }, {passive: false});
+  window.addEventListener("resize", () => rpRender());
+  window.addEventListener("keydown", ev => {
+    const t = ev.target;
+    const inEditor = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA");
+    if((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s"){
+      ev.preventDefault();          // Ctrl+S 直接覆盖保存当前文件（用户批注 B13）
+      saveJson();
+      return;
+    }
+    if(!rpState) return;
+    if(ev.key === "Escape"){
+      if(document.getElementById("rp-modal").style.display === "flex"){ rpCloseBig(); return; }
+      if(rpState.tool === "polygon" && rpState.sel >= 0){
+        rpFinishPoly(rpState.items[rpState.sel]);   // Esc=收尾（≥3 顶点成形，否则丢弃）
+        return;
+      }
+    }
+    if(ev.key !== "Delete" || inEditor) return;
+    if(rpState.sel >= 0){ rpState.items.splice(rpState.sel, 1); rpState.sel = -1;
+      rpRender(); rpWrite(graph.getNodeById(rpState.nodeId)); }
+  });
+})();
+
+// ================= 画布自适应 =================
+function resizeCanvas(){
+  const box = document.getElementById("canvasbox");
+  canvas.canvas.width = box.clientWidth;
+  canvas.canvas.height = box.clientHeight;
+  canvas.setDirty(true, true);
+}
+window.addEventListener("resize", resizeCanvas);
+resizeCanvas();
+// 调试开关：?nort=1 时不启动连续渲染循环（二分定位用）
+if(!location.search.includes("nort")) canvas.startRendering();
+canvas.setDirty(true, true);
+setStatus("新建或打开流程后开始编辑");
+</script>
+</body>
+</html>

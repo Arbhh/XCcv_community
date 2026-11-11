@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Defect Augment Studio — 工业缺陷增强编辑器</title>
+<link rel="stylesheet" href="css/app.css">
+<link rel="stylesheet" href="css/compat.css">
+</head>
+<body class="mode-edit">
+
+<!-- ══════════ 顶部工具条 ══════════ -->
+<header id="topbar">
+  <div class="tb-group">
+    <span class="brand">⛏ Defect Augment Studio</span>
+    <button id="btnOpenTarget" class="btn primary">打开目标图像</button>
+    <button id="btnExtractMode" class="btn">抠图模式</button>
+    <button id="btnPaintMode" class="btn">绘制缺陷</button>
+  </div>
+
+  <div class="tb-group" id="editTools">
+    <button class="btn tool active" data-tool="select" title="选择/移动 (V)">▣ 选择</button>
+    <button class="btn tool" data-tool="pan" title="平移画布 (空格+拖拽)">✥ 平移</button>
+    <span class="tb-sep"></span>
+    <button id="btnUndo" class="btn" title="撤销 (Ctrl+Z)">↶</button>
+    <button id="btnRedo" class="btn" title="重做 (Ctrl+Shift+Z)">↷</button>
+    <button id="btnDelete" class="btn" title="删除选中 (Del)">🗑</button>
+  </div>
+
+  <div class="tb-group" id="extractTools" style="display:none">
+    <button class="btn tool active" data-shape="poly" title="多边形选区">多边形</button>
+    <button class="btn tool" data-shape="rect" title="矩形选区">矩形</button>
+    <button class="btn tool" data-shape="ellipse" title="椭圆选区">椭圆</button>
+    <button class="btn tool" data-tool="brush" title="笔刷修正掩码">✎ 笔刷</button>
+  </div>
+
+  <div class="tb-group" id="paintTools" style="display:none">
+    <button class="btn tool active" data-pbrush="spot_bright" title="白点：亮色斑块">○ 白点</button>
+    <button class="btn tool" data-pbrush="spot_dark" title="黑点：暗色斑块">● 黑点</button>
+    <button class="btn tool" data-pbrush="scratch" title="划伤：拖拽绘制亮痕">／ 划伤</button>
+    <button class="btn tool" data-pbrush="stain" title="污渍：拖拽涂抹斑块簇">☻ 污渍</button>
+    <button class="btn tool" data-pbrush="dent" title="凹坑：径向内陷酒窝（包绕+凹面明暗+不规则深色核心）">◉ 凹坑</button>
+    <button class="btn tool" data-pbrush="eraser" title="橡皮：擦除笔迹">⌫ 橡皮</button>
+    <button class="btn tool" data-padjust title="调整已有缺陷：点选画布上的缺陷后，滑杆只调节它">🎯 调整</button>
+  </div>
+
+  <div class="tb-group">
+    <span class="tb-sep"></span>
+    <label class="chk"><input type="checkbox" id="chkSnap" checked> 吸附</label>
+    <label class="chk"><input type="checkbox" id="chkGrid"> 网格</label>
+    <select id="selGridSize" class="sel" title="网格尺寸">
+      <option value="8">8px</option>
+      <option value="16" selected>16px</option>
+      <option value="32">32px</option>
+    </select>
+    <span class="tb-sep"></span>
+    <label class="chk"><input type="checkbox" id="chkBoundary"> 边界高亮</label>
+    <label class="chk"><input type="checkbox" id="chkSplit"> Before/After 分屏</label>
+    <label class="chk"><input type="checkbox" id="chkMagnifier"> 放大镜</label>
+    <span class="tb-sep"></span>
+    <label class="chk" title="表面平滑度适宜度热力图（梯度能量越低越适合贴缺陷）"><input type="checkbox" id="chkHeatmap"> 热力图</label>
+    <label class="chk" title="放置时自动吸附到最近的平滑区域（Alt 拖拽绕过）"><input type="checkbox" id="chkSmartPlace" checked> 智能放置</label>
+    <button id="btnHelp" class="btn mini" title="快捷键帮助 (F1)">?</button>
+  </div>
+
+  <div class="tb-group grow"></div>
+
+  <div class="tb-group">
+    <button id="btnRec" class="btn rec">● 录制 Recipe</button>
+    <button id="btnRecipe" class="btn" title="回放/导入 Recipe (Ctrl+S 保存)">Recipe</button>
+    <button id="btnBatch" class="btn">批量粘贴到背景池</button>
+    <button id="btnExport" class="btn primary">导出</button>
+    <span id="apiStatus" class="api-dot" title="后端状态">●</span>
+  </div>
+</header>
+
+<div id="main">
+  <!-- ══════════ 左侧：资产库 / 抠图面板 ══════════ -->
+  <aside id="left">
+    <!-- 抠图面板（提取模式） -->
+    <section id="extractPanel" class="panel" style="display:none">
+      <h3>抠图 Extract</h3>
+      <div class="field-row">
+        <label>资产名称</label>
+        <input id="exName" type="text" placeholder="划痕_A">
+      </div>
+      <div class="field-row">
+        <label>标签</label>
+        <input id="exTags" type="text" placeholder="划痕, 批次A（逗号分隔）">
+      </div>
+      <div class="field-row">
+        <label>引擎</label>
+        <select id="exEngine" class="sel">
+          <option value="grabcut">GrabCut（快速，默认）</option>
+          <option value="fastsam">FastSAM（吞吐）</option>
+          <option value="mobilesam">MobileSAM（精度）</option>
+        </select>
+      </div>
+      <div class="field-row">
+        <label>GrabCut 迭代</label>
+        <input id="exIters" type="range" min="1" max="8" value="4">
+        <output id="exItersN">4</output>
+      </div>
+      <div class="hint">① 圈出缺陷范围 → ② 运行抠图 → ③ 笔刷修正 → ④ 入库。形状工具<b>单击</b>加点（矩形/椭圆拖拽），<b>双击 / 右键 / Enter</b> 仅闭合多边形（进入顶点调整，不自动抠图），<b>再次点击形状按钮</b>取消绘制进入调整模式；调整模式可拖拽顶点、<b>Alt+单击</b>删点，<b>Enter</b> 或「运行抠图」按钮提取，<b>Backspace / Ctrl+Z</b> 回退一点，<b>Esc</b> 重画。</div>
+      <button id="btnRunExtract" class="btn primary wide">▶ 运行抠图</button>
+      <button id="btnSelOnly" class="btn wide" title="跳过引擎，直接用选区作为掩码（配合笔刷修正）">▭ 仅用选区（跳过引擎）</button>
+      <hr>
+      <div class="field-row">
+        <label>笔刷</label>
+        <button id="exAdd" class="btn mini active">＋ 增加</button>
+        <button id="exErase" class="btn mini">－ 擦除</button>
+      </div>
+      <div class="field-row">
+        <label>笔刷大小</label>
+        <input id="exBrushSize" type="range" min="4" max="120" value="24">
+        <output id="exBrushSizeN">24px</output>
+      </div>
+      <div class="field-row">
+        <label>边缘收缩</label>
+        <input id="exShrink" type="range" min="-6" max="8" value="0">
+        <output id="exShrinkN">0</output>
+      </div>
+      <div class="field-row">
+        <label>边缘羽化</label>
+        <input id="exFeather" type="range" min="0" max="8" step="0.5" value="0">
+        <output id="exFeatherN">0px</output>
+      </div>
+      <div class="hint">收缩/羽化在下次运行抠图时生效；笔刷修正即时生效。</div>
+      <div class="btnrow">
+        <button id="btnToPoly" class="btn mini wide" title="把矩形/椭圆选区转为可编辑多边形：拖拽顶点变形，双击顶点删除">选区 → 可编辑多边形</button>
+      </div>
+      <div class="btnrow">
+        <button id="btnResetMask" class="btn mini grow">重置掩码</button>
+        <button id="btnSaveAsset" class="btn mini primary grow">✔ 保存到资产库</button>
+      </div>
+      <button id="btnExitExtract" class="btn wide">退出抠图模式</button>
+      <div id="exNote" class="note"></div>
+    </section>
+
+    <!-- 绘制缺陷面板 -->
+    <section id="paintPanel" class="panel" style="display:none">
+      <h3>绘制缺陷 Painter</h3>
+      <div id="pbSelInfo" hidden style="margin:4px 0 8px;padding:6px 8px;border:1px solid #3f7d5a;border-radius:6px;background:rgba(45,120,80,.16);font-size:12px;line-height:1.6">
+        正在调节<b>已选缺陷</b>：下方滑杆只作用于它。
+        <button id="pbSelClear" class="btn mini" style="margin-left:6px">完成</button>
+        <button id="pbSelDel" class="btn mini" title="删除该缺陷">删除</button>
+      </div>
+      <div class="field-row">
+        <label>资产名称</label>
+        <input id="pbName" type="text" placeholder="白点_01">
+      </div>
+      <div class="field-row">
+        <label>标签</label>
+        <input id="pbTags" type="text" placeholder="白点, 批次B">
+      </div>
+      <div class="field-row">
+        <label>笔迹大小</label>
+        <input id="pbSize" type="range" min="4" max="400" value="26">
+        <output id="pbSizeN">26px</output>
+      </div>
+      <div class="field-row">
+        <label>不规则度</label>
+        <input id="pbIrregular" type="range" min="0" max="1" step="0.05" value="0.35">
+        <output id="pbIrregularN">0.35</output>
+      </div>
+      <div class="field-row">
+        <label>软硬</label>
+        <input id="pbHardness" type="range" min="0.05" max="1" step="0.05" value="0.55">
+        <output id="pbHardnessN">0.55</output>
+      </div>
+      <div class="field-row">
+        <label>明暗强度</label>
+        <input id="pbStrength" type="range" min="0.1" max="1" step="0.05" value="0.7">
+        <output id="pbStrengthN">0.70</output>
+      </div>
+      <div class="field-row">
+        <label>颗粒度</label>
+        <input id="pbGrain" type="range" min="0" max="1" step="0.05" value="0.3">
+        <output id="pbGrainN">0.30</output>
+      </div>
+      <div class="field-row">
+        <label>弯移深度</label>
+        <input id="pbWarpStr" type="range" min="0" max="120" step="1" value="22">
+        <output id="pbWarpStrN">22px</output>
+      </div>
+      <div class="field-row">
+        <label>扭曲衰减</label>
+        <input id="pbWarpFall" type="range" min="1" max="4" step="0.1" value="2">
+        <output id="pbWarpFallN">2.0</output>
+      </div>
+      <div class="field-row">
+        <label>衰减带宽</label>
+        <input id="pbWarpRad" type="range" min="0.2" max="3" step="0.1" value="1">
+        <output id="pbWarpRadN">1.0×</output>
+      </div>
+      <div class="field-row">
+        <label>核心大小</label>
+        <input id="pbCore" type="range" min="0.15" max="0.6" step="0.01" value="0.35">
+        <output id="pbCoreN">0.35</output>
+      </div>
+      <div class="field-row">
+        <label>明暗对比</label>
+        <input id="pbShade" type="range" min="0.05" max="0.45" step="0.01" value="0.20">
+        <output id="pbShadeN">0.20</output>
+      </div>
+      <div class="field-row">
+        <label>旋涡强度</label>
+        <input id="pbSwirl" type="range" min="0" max="1" step="0.05" value="0.5">
+        <output id="pbSwirlN">0.50</output>
+      </div>
+      <div class="field-row">
+        <label>笔迹间距</label>
+        <input id="pbSpacing" type="range" min="0.4" max="2" step="0.05" value="1">
+        <output id="pbSpacingN">1.00</output>
+      </div>
+      <div class="hint">在目标图上直接绘制缺陷：<b>笔迹大小以原图真实像素计</b>（大图烘焙不缩放，光标圈与烘焙结果 1:1 对应）。凹坑按<b>径向内陷"酒窝"模型</b>合成（对齐真实工业凹点形貌）：四周条纹<b>向坑心对称包绕</b>，坑底冲蚀为光滑灰面并带<b>凹面明暗</b>（光向随种子偏转）与<b>不规则椭圆深色核心区</b>（随机朝向/长轴比/边界起伏，椭圆居多），整体随种子不规则变化、无明显分界线；<b>弯移深度/衰减/带宽</b>可调。划伤为独立<b>沟槽模型</b>：亮核暗晕沿走向时断时续、两侧条纹轻微挤压。非橡皮笔刷拖拽即笔画（黑白点/凹坑拖拽会沿路径铺成一簇缺陷，间距可调）；点击=单点。<b>画笔参数只作用于下一笔</b>；要修改已画的缺陷，点 <b>🎯 调整</b> 选中它再拖滑杆（滑杆此时只调节该缺陷，可删除）。再次点击笔刷取消绘制（左键拖拽平移）。吸管可随时从图像取色（绘制中 Alt+单击）。</div>
+      <div class="field-row">
+        <label>自定义颜色</label>
+        <label class="chk"><input type="checkbox" id="pbCustomColor" checked> 启用</label>
+        <button id="pbColorSwatch" class="btn mini" style="width:34px;height:22px;padding:0;border:1px solid #555;" title="打开三色盘（色相/饱和度/明度）"></button>
+        <button id="pbPick" class="btn mini" title="吸管：从图像取色">💉 取色</button>
+      </div>
+      <div class="btnrow">
+        <button id="pbUndo" class="btn mini">↶ 撤销上一笔</button>
+        <button id="pbClear" class="btn mini">清空</button>
+        <button id="pbReroll" class="btn mini" title="重掷形状随机种子">🎲 重掷</button>
+      </div>
+      <button id="btnBakeAsset" class="btn primary wide">✔ 生成缺陷资产</button>
+      <div class="btnrow" style="margin-top:6px">
+        <button id="btnExportPaint" class="btn" style="flex:1;text-align:center" title="把当前笔迹直接烘焙进原图并保存（可选保存目录，不经资产库）">⬇ 直接导出图像</button>
+        <button id="btnExportPaintJpg" class="btn mini" title="JPG 格式导出（体积更小）">JPG</button>
+      </div>
+      <button id="btnExitPaint" class="btn wide">退出绘制模式</button>
+    </section>
+
+    <!-- 资产面板 -->
+    <section id="assetPanel" class="panel grow">
+      <h3>缺陷资产库</h3>
+      <input id="assetSearch" type="text" placeholder="🔍 搜索名称/标签…">
+      <div id="assetTagBar" class="tag-bar"></div>
+      <div id="assetList" class="asset-list"></div>
+      <div class="hint">拖拽缩略图到画布放置；双击名称重命名；「存变体」把选中实例的外观/形态存为变体。</div>
+    </section>
+  </aside>
+
+  <!-- ══════════ 中央：画布 ══════════ -->
+  <div id="center">
+    <div id="canvasWrap">
+      <canvas id="cv"></canvas>
+      <div id="pvBadge" class="pv-badge" hidden></div>
+      <div id="emptyHint">
+        <h2>开始使用</h2>
+        <p>① 点击 <b>打开目标图像</b> 载入背景图（支持 4K–8K，自动降采样代理编辑）</p>
+        <p>② 点击 <b>抠图模式</b> 或拖入缺陷源图，圈选缺陷入库</p>
+        <p>③ 拖拽资产到画布 → 变换 / 外观增强 / Poisson 融合</p>
+        <p>④ <b>批量粘贴到背景池</b> 或 <b>导出</b> 合成结果</p>
+        <p class="dim">裸滚轮缩放 · 空格+拖拽平移 · 双击空白适配 · 双击实例进入变形</p>
+      </div>
+      <div id="alignBar">
+        <button id="alLeft" title="左对齐">⇤</button>
+        <button id="alCenterH" title="水平居中">↔</button>
+        <button id="alRight" title="右对齐">⇥</button>
+        <span></span>
+        <button id="alTop" title="顶对齐">⇧</button>
+        <button id="alCenterV" title="垂直居中">↕</button>
+        <button id="alBottom" title="底对齐">⇩</button>
+        <span></span>
+        <button id="alDistH" title="水平等距分布">☰</button>
+        <button id="alDistV" title="垂直等距分布">≣</button>
+      </div>
+      <div id="editModeBar" style="display:none">
+        <span class="dim">变形编辑：</span>
+        <button data-edit="affine">仿射</button>
+        <button data-edit="mesh">网格 FFD</button>
+        <button data-edit="persp">透视</button>
+        <span class="dim">Esc 退出</span>
+      </div>
+    </div>
+    <div id="historyStripWrap">
+      <span class="strip-label">历史：</span>
+      <div id="historyStrip"></div>
+    </div>
+    <div id="statusbar">
+      <span id="statusInfo">—</span>
+      <button id="btnZoom100" class="btn mini" title="100% 显示">1:1</button>
+      <button id="btnZoomFit" class="btn mini" title="适配窗口">适配</button>
+      <span class="grow"></span>
+      <span class="dim">GrabCut=快速抠图 · Poisson=默认融合 · 滚轮缩放画布 / Ctrl+滚轮缩放实例 · 按住 Tab 看原图</span>
+      <span class="dim" id="buildTag" style="margin-left:10px;opacity:.65"></span>
+    </div>
+  </div>
+
+  <!-- ══════════ 右侧：属性面板 ══════════ -->
+  <aside id="right">
+    <div id="scopeBadge" class="scope-badge">未选中实例</div>
+    <section class="panel">
+      <h3>变换 Transform</h3>
+      <div class="grid2">
+        <div class="field-row"><label>X</label><input id="tfPosX" type="number" step="1"></div>
+        <div class="field-row"><label>Y</label><input id="tfPosY" type="number" step="1"></div>
+        <div class="field-row"><label>缩放X</label><input id="tfScaleX" type="number" step="0.05"></div>
+        <div class="field-row"><label>缩放Y</label><input id="tfScaleY" type="number" step="0.05"></div>
+      </div>
+      <label class="chk"><input type="checkbox" id="tfLock" checked> 等比锁定</label>
+      <div class="field-row"><label>旋转°</label><input id="tfRot" type="number" step="1"></div>
+      <div class="grid2">
+        <div class="field-row"><label>错切X</label><input id="tfShearX" type="number" step="0.05"></div>
+        <div class="field-row"><label>错切Y</label><input id="tfShearY" type="number" step="0.05"></div>
+      </div>
+      <div class="btnrow">
+        <button id="tfFlipH" class="btn mini">⇋ 水平翻转</button>
+        <button id="tfFlipV" class="btn mini">⇅ 垂直翻转</button>
+        <button id="tfReset" class="btn mini">重置</button>
+        <button id="tfRaise" class="btn mini">置于顶层</button>
+      </div>
+      <div class="btnrow">
+        <button id="btnEditAffine" class="btn mini">仿射模式</button>
+        <button id="btnEditPersp" class="btn mini">透视变换</button>
+        <button id="btnEditMesh" class="btn mini">网格 FFD</button>
+      </div>
+      <div class="btnrow">
+        <button id="btnInstToAsset" class="btn mini" title="把选中实例（含变形与外观）渲染为新的可复用资产">实例存为资产</button>
+        <button id="btnElastic" class="btn mini">弹性扰动</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h3>外观增强 Appearance</h3>
+      <div class="field-row"><label>亮度</label><input id="ap_brightness" type="range" min="-50" max="50" step="1" value="0"><output id="apn_brightness">0</output></div>
+      <div class="field-row"><label>对比度</label><input id="ap_contrast" type="range" min="0.5" max="2" step="0.01" value="1"><output id="apn_contrast">1.00</output></div>
+      <div class="field-row"><label>色相°</label><input id="ap_hue" type="range" min="-30" max="30" step="1" value="0"><output id="apn_hue">0</output></div>
+      <div class="field-row"><label>饱和度</label><input id="ap_saturation" type="range" min="0" max="2" step="0.01" value="1"><output id="apn_saturation">1.00</output></div>
+      <div class="field-row"><label>模糊px</label><input id="ap_blur" type="range" min="0" max="5" step="0.1" value="0"><output id="apn_blur">0.0</output></div>
+      <div class="field-row"><label>噪声σ</label><input id="ap_noise" type="range" min="0" max="15" step="0.5" value="0"><output id="apn_noise">0.0</output></div>
+      <div class="btnrow">
+        <button id="apReset" class="btn mini">重置</button>
+        <button id="apAutoLevel" class="btn mini" title="按缺陷亮度分布自动设定亮度/对比度，使缺陷映射到标准灰域">自适应外观</button>
+        <button id="apApplySel" class="btn mini">统一应用到选中</button>
+      </div>
+      <div class="hint">外观仅作用于掩码内像素，不会带出背景色偏。</div>
+    </section>
+
+    <section class="panel">
+      <h3>融合 Blend</h3>
+      <label class="chk"><input type="radio" name="blend" id="bl_poisson" checked> Poisson 梯度域融合（默认）</label>
+      <label class="chk"><input type="radio" name="blend" id="bl_feather"> Feather 边缘羽化</label>
+      <label class="chk"><input type="radio" name="blend" id="bl_direct"> Direct 直接叠加（最快）</label>
+      <div class="field-row"><label>羽化半径</label><input id="blFeather" type="range" min="0" max="20" step="1" value="3"><output id="blFeatherN">3</output></div>
+      <div class="field-row"><label>边缘模糊</label><input id="blEdgeBlur" type="range" min="0" max="12" step="0.5" value="0"><output id="blEdgeBlurN">0.0</output></div>
+      <div class="hint">边缘模糊：缺陷轮廓与颜色一起向背景渐隐（区别于羽化的纯 alpha 渐变），融合更自然；对 Feather/Direct 尤其有效。</div>
+      <div class="field-row"><label>不透明度</label><input id="blOpacity" type="range" min="0.1" max="1" step="0.05" value="1"><output id="blOpacityN">1.00</output></div>
+      <label class="chk"><input type="checkbox" id="blMixed"> Mixed Clone（保留缺陷强边缘）</label>
+      <label class="chk"><input type="checkbox" id="blPreview" checked> Poisson 预览（异步，约 0.5s）</label>
+      <label class="chk" title="把缺陷的亮度/彩色统计对齐到其周边背景，消除贴图违和感（Reinhard 颜色迁移）"><input type="checkbox" id="blHarmonize"> 光照协调（融入本地光照）</label>
+      <div class="field-row" id="blHarmRow" style="display:none">
+        <label>协调强度</label><input id="blHarmStr" type="range" min="0" max="1" step="0.05" value="0.8"><output id="blHarmStrN">0.80</output>
+      </div>
+      <div class="field-row" id="blHarmRow2" style="display:none">
+        <label>采样环宽</label><input id="blHarmRing" type="range" min="4" max="24" step="2" value="10"><output id="blHarmRingN">10px</output>
+      </div>
+      <div id="blendNote" class="note"></div>
+    </section>
+
+    <section class="panel">
+      <h3>直方图 Histogram</h3>
+      <canvas id="histCanvas" width="252" height="64" class="hist-canvas"></canvas>
+      <div class="hint">当前合成的亮度分布（场景变更实时刷新）。</div>
+    </section>
+
+    <section class="panel">
+      <h3>放大镜 Magnifier</h3>
+      <div class="field-row"><label>倍率</label><input id="mgZoom" type="range" min="2" max="8" step="1" value="3"><output id="mgZoomN">3×</output></div>
+      <div class="field-row"><label>半径</label><input id="mgRadius" type="range" min="50" max="200" step="10" value="90"><output id="mgRadiusN">90px</output></div>
+      <div class="hint">开启「放大镜」后跟随鼠标，用于检查缺陷边缘的像素级融合质量。</div>
+    </section>
+  </aside>
+</div>
+
+<!-- ══════════ 对话框 ══════════ -->
+<dialog id="helpDlg">
+  <h3>快捷键（Photoshop 兼容）</h3>
+  <table class="help-table">
+    <tr><td>撤销 / 重做</td><td>Ctrl+Z / Ctrl+Shift+Z（抠图绘制中=回退顶点/笔迹）</td></tr>
+    <tr><td>按住看原图</td><td>Tab（编辑 / 绘制模式）</td></tr>
+    <tr><td>退出当前模式</td><td>Esc（绘制模式）</td></tr>
+    <tr><td>删除选中实例</td><td>Delete / Backspace</td></tr>
+    <tr><td>复制 / 粘贴</td><td>Ctrl+C / Ctrl+V</td></tr>
+    <tr><td>原位复制并拖拽</td><td>Ctrl+拖拽</td></tr>
+    <tr><td>全选 / 取消选择</td><td>Ctrl+A / Esc</td></tr>
+    <tr><td>缩放画布（锚点鼠标）</td><td>滚轮</td></tr>
+    <tr><td>缩放选中实例</td><td>Ctrl+滚轮</td></tr>
+    <tr><td>平移画布</td><td>空格+拖拽 / 中键拖拽</td></tr>
+    <tr><td>适配画布到窗口</td><td>双击空白处</td></tr>
+    <tr><td>进入变形编辑</td><td>双击实例</td></tr>
+    <tr><td>网格微调 / 步进微调</td><td>方向键 / Shift+方向键</td></tr>
+    <tr><td>旋转 15° 步进</td><td>Shift+旋转柄</td></tr>
+    <tr><td>多边形闭合（抠图模式）</td><td>双击 / 右键 / Enter（任何时刻生效）</td></tr>
+    <tr><td>多边形回退一点</td><td>Backspace / Ctrl+Z</td></tr>
+    <tr><td>多边形删除顶点（闭合后）</td><td>Alt+单击顶点</td></tr>
+    <tr><td>吸管取色（绘制模式）</td><td>Alt+单击画布</td></tr>
+    <tr><td>多边形闭合 / 回退</td><td>Enter / Backspace</td></tr>
+    <tr><td>绕过智能放置吸附</td><td>Alt+拖放</td></tr>
+    <tr><td>保存 Recipe</td><td>Ctrl+S</td></tr>
+  </table>
+  <div class="btnrow end"><button id="helpClose" class="btn">关闭</button></div>
+</dialog>
+
+<dialog id="exportDlg">
+  <h3>导出合成图像</h3>
+  <div class="field-row"><label>分辨率</label>
+    <div class="hint" style="margin:2px 0 8px">支持自选保存位置的浏览器（Chrome/Edge）会弹出系统保存对话框，可自行选择目录与文件名；其它浏览器保存到默认下载目录。</div>
+    <select id="expRes" class="sel">
+      <option value="full">原图全分辨率（回原分辨率重算）</option>
+      <option value="view">当前视图分辨率（更快）</option>
+    </select>
+  </div>
+  <div class="field-row"><label>格式</label>
+    <select id="expFormat" class="sel">
+      <option value="png">PNG</option>
+      <option value="jpeg">JPEG</option>
+      <option value="tiff">TIFF</option>
+    </select>
+  </div>
+  <div class="field-row" id="expQualityRow" style="display:none"><label>质量</label><input id="expQuality" type="range" min="60" max="100" value="95"><output>95</output></div>
+  <div class="field-row"><label>文件名</label><input id="expName" type="text" value="composite"></div>
+  <div class="btnrow end">
+    <button id="expClose" class="btn">关闭</button>
+    <button id="expDoExport" class="btn primary">导出</button>
+  </div>
+  <div id="expStatus" class="note"></div>
+</dialog>
+
+<dialog id="batchDlg">
+  <h3>批量粘贴到背景池</h3>
+  <div class="hint">将当前画布场景（或已录制的 Recipe）按<b>相对位置 + 短边比例缩放</b>回放到每一张背景图，服务器端全分辨率合成。</div>
+  <label class="chk"><input type="checkbox" id="batchUseRecipe" checked> 使用已录制的 Recipe（若有）；否则使用当前画布场景</label>
+  <div class="field-row"><label>背景来源</label>
+    <select id="batchSource" class="sel">
+      <option value="dir">服务器目录 / 本地选择</option>
+      <option value="files">上传多个文件</option>
+    </select>
+  </div>
+  <div class="field-row" id="batchDirRow">
+    <label>目录</label>
+    <input id="batchDirPath" type="text" placeholder="服务器上的绝对路径，如 D:\data\backgrounds">
+    <button id="batchPickDir" class="btn mini">选择本地文件夹</button>
+    <input id="batchDirInput" type="file" multiple accept="image/*" webkitdirectory style="display:none">
+  </div>
+  <div class="field-row" id="batchUploadRow" style="display:none">
+    <label>文件</label>
+    <button id="batchPickFiles" class="btn mini">选择图像文件</button>
+    <span id="batchDirInfo" class="dim"></span>
+  </div>
+  <div class="field-row"><label>输出目录</label><input id="batchOutDir" type="text" value="output"></div>
+  <div class="field-row"><label>格式</label>
+    <select id="batchFormat" class="sel">
+      <option value="png">PNG</option>
+      <option value="jpeg">JPEG</option>
+      <option value="tiff">TIFF</option>
+    </select>
+  </div>
+  <label class="chk"><input type="checkbox" id="batchJitter" checked> 随机抖动（避免批量样本雷同）</label>
+  <div class="grid3">
+    <div class="field-row"><label>位置±%</label><input id="batchJitPos" type="number" value="2" min="0" max="10" step="0.5"></div>
+    <div class="field-row"><label>旋转±°</label><input id="batchJitRot" type="number" value="3" min="0" max="15" step="0.5"></div>
+    <div class="field-row"><label>亮度±</label><input id="batchJitBright" type="number" value="5" min="0" max="30" step="1"></div>
+  </div>
+  <div class="field-row"><label>随机种子</label><input id="batchSeed" type="number" value="42"></div>
+  <div class="btnrow end">
+    <button id="batchCancelRun" class="btn" disabled>取消作业</button>
+    <button id="batchClose" class="btn">关闭</button>
+    <button id="batchDoRun" class="btn primary">开始批量合成</button>
+  </div>
+  <div id="batchProgressRow" style="display:none">
+    <div class="progress"><div id="batchProgressBar"></div></div>
+    <span id="batchProgressText">0/0</span>
+  </div>
+  <div id="batchReport"></div>
+</dialog>
+
+<dialog id="recipeDlg">
+  <h3>Recipe 操作配方</h3>
+  <div id="rcInfo" class="hint"></div>
+  <div class="field-row"><label>名称</label><input id="recipeName" type="text" placeholder="缺陷配方_划痕"></div>
+  <div class="field-row"><label>文件</label><button id="rcLoadBtn" class="btn mini">选择 .recipe.json</button><input id="rcFile" type="file" accept=".json" style="display:none"></div>
+  <div class="hint">回放会在当前目标图上按<b>相对位置 + 短边比例缩放</b>重建步骤中的实例。</div>
+  <div class="btnrow end">
+    <button id="rcClose" class="btn">关闭</button>
+    <button id="rcDoReplay" class="btn primary">回放到当前画布</button>
+  </div>
+</dialog>
+
+<div id="toasts"></div>
+<div id="bootErrors" style="display:none;position:fixed;bottom:0;left:0;right:0;z-index:999;background:#5a1e1e;color:#ffd7d7;font:12px/1.5 monospace;padding:8px 12px;max-height:40%;overflow:auto;white-space:pre-wrap"></div>
+<script>
+  // 启动错误捕获：模块加载失败时直接显示在页面底部
+  (function () {
+    const box = document.getElementById('bootErrors');
+    const show = (msg) => { box.style.display = 'block'; box.textContent += msg + '\n'; };
+    window.addEventListener('error', (e) => show('[error] ' + e.message + ' @ ' + (e.filename || '') + ':' + (e.lineno || '')));
+    window.addEventListener('unhandledrejection', (e) => show('[promise] ' + (e.reason && e.reason.stack || e.reason)));
+  })();
+</script>
+<script src="js/compat.js"></script>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
