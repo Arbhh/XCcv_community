@@ -5,6 +5,9 @@ __pycache__/
 .venv/
 venv/
 
+# 本机解释器配置（每台机器不同，不入库）
+python_path.txt
+
 # 运行期用户数据
 platform_data/
 
