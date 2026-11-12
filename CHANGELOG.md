@@ -3,6 +3,21 @@
 本文件记录 XCcv Community 的显著变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.2-community] - 2026-11-12
+
+### 修复
+
+- `run_*.bat` 启动脚本改为**纯 ASCII**，消除 Windows 代码页差异导致的启动报错提示中文乱码；
+  中文诊断指引移至 `tools/env_check.py`
+
+### 新增
+
+- 解释器指定文件 `python_path.txt`（一行完整路径；已加入 .gitignore，每台机器可不同），
+  启动脚本候选解释器优先级扩展并逐一实测（`XCCV_PY` → `python_path.txt` → PATH `python` →
+  `py -3` → `C:\XCcv\venv` → 本目录 venv/.venv）
+- 环境诊断脚本 `tools/env_check.py`：中文输出每个候选解释器可用性与失败原因
+- 附录文档 `docs/XCcv社区版_项目简介.docx` 与主界面截图 `docs/images/main.png`
+
 ## [0.6.1-community] - 2026-11-11
 
 首个开源发布版本（经发布前评审后发布）。

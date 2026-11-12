@@ -4,6 +4,10 @@ XCcv Community 是一个面向工业视觉场景的**离线桌面端**深度学�
 覆盖 **数据标注 → 模型训练 → 测试评估** 全流程，并附 **缺陷样本合成** 工具。
 零基础用户通过桌面 UI 即可完成一个视觉模型从数据到权重的完整落地，全程本地运行、数据不出内网。
 
+![XCcv 主界面（AI 平台）](docs/images/main.png)
+
+> 主界面：标注 → 训练 → 测试 三步落地，另附缺陷样本合成与流程图编排模块。
+
 ## 功能总览
 
 | 模块 | 能力 |
@@ -42,10 +46,20 @@ pip install -r requirements.txt
 
 ## 快速开始
 
-> **启动环境（重要）**：主界面与流程画布、缺陷样本合成都依赖 PyQtWebEngine。
-> `run_*.bat` 会依次尝试 `XCCV_PY` 环境变量 → 本目录 `venv` → `.venv` → PATH 中的 python，
-> 并在启动前校验 QtWebEngine；校验失败会给出中文提示而不是静默打不开窗口。
-> 若使用自己的解释器，请确认已安装 `PyQtWebEngine`（见 requirements.txt）。
+> **启动环境（重要）**：主界面、流程画布、缺陷样本合成都依赖 PyQtWebEngine。
+> `run_*.bat` 为纯 ASCII 脚本，**不要求本目录存在 venv**，按下列优先级逐个实测
+> （唯一的判据是能否 `import PyQt5.QtWebEngineWidgets`）：
+>
+> 1. `XCCV_PY` 环境变量；
+> 2. 本目录 `python_path.txt`（一行：指向 python.exe 的完整路径）；
+> 3. PATH 中的 `python`；
+> 4. `py` 启动器（`py -3`）；
+> 5. `C:\XCcv\venv`（产品环境的约定位置，存在且可用才用）；
+> 6. 本目录 `venv` / `.venv`（可选兜底）。
+>
+> 全部不可用时输出英文指引，并调用 `tools\env_check.py` 打印中文诊断（列出每个候选
+> 是否可用及失败原因）。推荐在目标机器上写一行 `python_path.txt`，例如：
+> `C:\XCcv\venv\Scripts\python.exe`（该文件已加入 .gitignore，每台机器可不同）。
 
 双击 `run_main.bat`（或 `python -m xccv.app`）打开主界面，按卡片进入各平台：
 
@@ -66,7 +80,8 @@ run_flow.bat         :: 流程图（独立窗口；主界面左侧导航亦可�
 run_defectgen.bat    :: 缺陷样本合成
 ```
 
-详细上手文档见 [docs/quickstart.md](docs/quickstart.md)。
+详细上手文档见 [docs/quickstart.md](docs/quickstart.md)；完整的项目介绍
+（定位、功能详解、技术架构、合规说明）见附录 [docs/XCcv社区版_项目简介.docx](docs/XCcv社区版_项目简介.docx)。
 
 ### 可选：AI 智能标注权重
 
@@ -89,7 +104,7 @@ XCcv-Community/
 │   │   └── flow/        #     流程图引擎（类型化端口 IR / 执行器 / 36 算子）
 │   └── assets/          #   图标资源
 ├── labelme/             # vendored labelme 5.8.1（GPLv3，含本地修改，清单见 labelme/MODIFICATIONS.md）
-├── docs/                # 快速上手文档
+├── docs/                # 快速上手文档 / 项目简介附录 / 界面截图
 ├── licenses/            # 许可证文本（AGPL-3.0 / labelme GPLv3）
 ├── requirements.txt
 └── run_*.bat            # 各平台启动脚本
