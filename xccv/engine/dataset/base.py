@@ -14,15 +14,19 @@ _TASK_LABELS = {
     "classification": "图像分类",
     "detection": "目标检测",
     "segmentation": "实例分割",
+    "anomaly": "无监督异常检测",
+    "ocr": "OCR 字符识别",
 }
 
 
 class TaskType(str, Enum):
-    """平台支持的三种任务类型。"""
+    """平台支持的五种任务类型（V0.7 增无监督异常检测/OCR 字符识别）。"""
 
     CLASSIFICATION = "classification"
     DETECTION = "detection"
     SEGMENTATION = "segmentation"
+    ANOMALY = "anomaly"
+    OCR = "ocr"
 
     @property
     def label(self) -> str:

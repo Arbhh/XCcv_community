@@ -21,6 +21,7 @@ import numpy as np
 from ..engine.dataset import IMAGE_EXTS
 from ..engine.dataset.base import TaskType
 from ..engine.dataset.converters import split_samples
+from ..engine.dataset.ignore import IGNORE_LABEL
 from ..engine.dataset.reader import scan_classification_dataset, scan_labelme_dataset
 from ..engine.io_utils import imread_unicode
 from .dev_options import DevOptions
@@ -247,6 +248,59 @@ def _check_size_outliers(samples: list, opt: DevOptions) -> list:
     return []
 
 
+def _check_ignore_regions(samples: list) -> list:
+    """O8（V0.7）：`__ignore__` 忽略区域可见性（信息级）。
+
+    告知用户数据里存在忽略区域、将被近似语义剔除的 GT 数量，避免
+    "标注突然变少"的困惑；语义与限制见《XCcv 操作流程手册》。
+    """
+    from ..engine.dataset.ignore import filter_ignore_shapes
+
+    n_regions = n_dropped = 0
+    for s in samples:
+        _, nr, nd = filter_ignore_shapes(s.shapes)
+        n_regions += nr
+        n_dropped += nd
+    if not n_regions:
+        return []
+    return [HealthIssue(
+        LEVEL_INFO, "ignore_regions", "存在 __ignore__ 忽略区域",
+        f"数据集共有 {n_regions} 个忽略区域；训练/评估时将剔除与其重叠率"
+        f">50% 的 GT 实例 {n_dropped} 个（近似语义：区域内背景仍参与学习，"
+        "区域内检出不计误检）。",
+        "适用于反光、丝纹等界限模糊区域：标注平台画矩形/多边形、标签填 "
+        "__ignore__ 即可；若非故意标注请删除该标签。")]
+
+
+def _check_ok_ratio(dataset_dir: Path, task: TaskType, samples: list) -> list:
+    """O6（V0.7）：OK 负样本利用与比例（对照 VIMO「合格:缺陷 ≈ 1:1~1:2」）。
+
+    信息级不阻断；口径与训练侧一致——OK 图 = NEGATIVE_DIR_NAMES 目录内
+    无同名 json 的图片（reader.scan_negative_images 同源）。
+    """
+    if task is TaskType.CLASSIFICATION:
+        return []
+    from ..engine.dataset.reader import scan_negative_images
+
+    n_ok = len(scan_negative_images(dataset_dir))
+    n_defect_img = sum(1 for s in samples if s.shapes)
+    if n_ok == 0:
+        return [HealthIssue(
+            LEVEL_INFO, "ok_missing", "未利用 OK 负样本",
+            f"当前 {n_defect_img} 张含标注图片参与训练，OK 背景图 0 张。",
+            "工业场景误检风险高：建议建一个名为 OK/良品/正常 的子文件夹"
+            "放入良品图（无需标注），训练时保持「负样本训练」勾选。")]
+    ratio = n_ok / max(1, n_defect_img)
+    if ratio < 0.5 or ratio > 2.0:
+        return [HealthIssue(
+            LEVEL_INFO, "ok_ratio", "OK 图与缺陷图比例偏离建议区间",
+            f"OK 图 {n_ok} 张、含标注缺陷图 {n_defect_img} 张"
+            f"（约 {ratio:.1%}）；经验建议区间 OK:缺陷 ≈ 1:1~1:2。",
+            "OK 过少防误检收益有限；OK 过多会稀释缺陷样本（训练侧超量"
+            "自动按种子抽样、验证侧全保留用于误检率统计）。")]
+    return []
+
+
 def run_health_check(task, dataset_dir, options: DevOptions | None = None,
                      val_ratio: float = 0.2, seed: int = 42, train_ratio=None,
                      scan=None) -> HealthReport:
@@ -258,8 +312,17 @@ def run_health_check(task, dataset_dir, options: DevOptions | None = None,
     task = TaskType(task)
     dataset_dir = Path(dataset_dir)
     issues: list = []
+    is_anomaly = task in (TaskType.ANOMALY, TaskType.OCR)
+    # A1/A2：无监督异常检测与 OCR 无实例级类别语义——不均衡/单类数量/
+    # 验证覆盖/未标注四项跳过（见下方分支守卫）
 
-    if task is TaskType.CLASSIFICATION:
+    if task is TaskType.OCR and scan is None:
+        # OCR 数据仍是 labelme 结构（rectangle + label=文本内容），
+        # 不能按分类文件夹扫描（否则体检图片数为 0）
+        samples, classes, _ = scan_labelme_dataset(dataset_dir)
+        scan = (samples, classes)
+
+    if task is TaskType.CLASSIFICATION or is_anomaly:
         if scan is None:
             samples, classes = scan_classification_dataset(dataset_dir)
         else:
@@ -275,6 +338,8 @@ def run_health_check(task, dataset_dir, options: DevOptions | None = None,
         counts = {c: 0 for c in classes}
         for s in samples:
             for sh in s.shapes:
+                if sh.label == IGNORE_LABEL:   # O8：忽略区域不是类别，不进样本统计
+                    continue
                 counts[sh.label] = counts.get(sh.label, 0) + 1
 
     report = HealthReport(n_images=len(samples), classes=list(classes))
@@ -289,12 +354,16 @@ def run_health_check(task, dataset_dir, options: DevOptions | None = None,
         report.issues = issues
         return report
 
-    issues += _check_imbalance(counts, opt)
-    issues += _check_few_samples(counts, task, opt)
-    issues += _check_val_coverage(task, samples, classes, val_ratio, seed,
-                                  train_ratio)
-    if task is not TaskType.CLASSIFICATION:
+    if not is_anomaly:
+        # 异常检测/OCR：无实例级标注语义——不均衡/单类数量/验证覆盖/未标注四项跳过
+        issues += _check_imbalance(counts, opt)
+        issues += _check_few_samples(counts, task, opt)
+        issues += _check_val_coverage(task, samples, classes, val_ratio, seed,
+                                      train_ratio)
         issues += _check_unlabeled(dataset_dir)
+    if task in (TaskType.DETECTION, TaskType.SEGMENTATION):
+        issues += _check_ok_ratio(dataset_dir, task, samples)
+        issues += _check_ignore_regions(samples)  # O8（V0.7）：忽略区域可见性
     issues += _check_duplicates(dataset_dir, samples, opt)
     issues += _check_size_outliers(samples, opt)
 

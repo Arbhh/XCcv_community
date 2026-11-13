@@ -314,6 +314,9 @@ class Canvas(QtWidgets.QWidget):
                 polygon_from_mask.compute_polygon_from_mask(mask=_m)
                 self.aiModelReady.emit(model_name)
             except Exception as e:  # noqa: BLE001
+                # 失败必须解锁：_ai_loading 卡 True 会吞掉后续所有点击与
+                # 重试（S 键入口首行即被拦），AI 标注永久失效（T5 根因）
+                self._ai_loading = False
                 self.aiModelFailed.emit(str(e))
 
         threading.Thread(target=_work, daemon=True).start()
@@ -1360,6 +1363,9 @@ class Canvas(QtWidgets.QWidget):
         self._ai_last_commit = (time.monotonic() if t_click is None
                                 else t_click, len(self._ai_prompts))
         self._ai_refined_n = -1
+        if self._ai_embedding() is None and self._sam is not None:
+            # 首次点击嵌入未就绪：明确告知（第四批，防用户无反馈重复点击）
+            self.aiStatus.emit("正在计算图像嵌入（首次约数秒），请稍候…")
         self._ai_request(self._ai_prompts, "refine")
         self.update()
 

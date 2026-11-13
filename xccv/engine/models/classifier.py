@@ -49,10 +49,11 @@ class _FolderDataset(Dataset):
 
     def __init__(self, samples, classes: list[str], input_size,
                  augment_ops: dict | None, train: bool,
-                 augment_probs: dict | None = None):
+                 augment_probs: dict | None = None, grayscale: bool = False):
         self.samples = samples
         self.class_to_idx = {c: i for i, c in enumerate(classes)}
         self.targets = [self.class_to_idx[s.label] for s in samples]
+        self._gray = bool(grayscale)  # O5（V0.7）：灰度训练读图口径
         hw = (input_size, input_size) if isinstance(input_size, int) else tuple(input_size)
         self._hw = (int(hw[0]), int(hw[1]))  # (高, 宽)
         self._augment_ops = dict(augment_ops) if (train and augment_ops) else None
@@ -65,7 +66,7 @@ class _FolderDataset(Dataset):
 
     def __getitem__(self, index: int):
         s = self.samples[index]
-        img = imread_unicode(s.image_path)
+        img = imread_unicode(s.image_path, color=not self._gray)
         if img is None:
             raise FileNotFoundError(f"无法读取图片: {s.image_path}")
         if self._augment_ops:  # 按每算子启用概率随机增强，其余取样保持原图
@@ -181,14 +182,20 @@ class ClassifierModel(BaseModel):
             self.industrial = cfg.industrial_opt
             self._frozen = cfg.freeze_backbone
         # 直接读取原始数据集（训练侧在线增强），不再把数据集复制到输出目录
+        gray = getattr(cfg, "color_mode", "color") == "gray"
+        self.color_mode = "gray" if gray else "color"  # O5：评估/推理同口径
         train_set = _FolderDataset(data.train_samples, data.classes, input_size,
                                    cfg.augment_ops, train=True,
-                                   augment_probs=cfg.augment_probs)
+                                   augment_probs=cfg.augment_probs, grayscale=gray)
         val_set = _FolderDataset(data.val_samples, data.classes, input_size,
-                                 None, train=False)
+                                 None, train=False, grayscale=gray)
 
+        # E3（V0.7）：确定性训练时固定 DataLoader 采样生成器（shuffle 可复现）
+        gen = (torch.Generator().manual_seed(cfg.seed)
+               if getattr(cfg, "deterministic", False) else None)
         loader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True,
-                            num_workers=cfg.workers, pin_memory=self.device == "cuda")
+                            num_workers=cfg.workers, pin_memory=self.device == "cuda",
+                            generator=gen)
         vloader = DataLoader(val_set, batch_size=cfg.batch_size,
                              num_workers=cfg.workers, pin_memory=self.device == "cuda")
         opt = torch.optim.AdamW(
@@ -304,6 +311,7 @@ class ClassifierModel(BaseModel):
             "format": "xccv-classifier", "arch": self.arch, "classes": data.classes,
             "image_size": self._input_size, "state_dict": self.net.state_dict(),
             "industrial_opt": cfg.industrial_opt, "loss_type": loss_type,
+            "color_mode": getattr(cfg, "color_mode", "color"),  # O5（V0.7）
         }
         if cfg.resume_from_pruned:
             best_ckpt["net_module"] = self.net  # 剪后网络结构随文件保存
@@ -353,6 +361,10 @@ class ClassifierModel(BaseModel):
     @torch.no_grad()
     def predict(self, image_bgr: np.ndarray, conf: float = 0.0, iou: float = 0.0) -> Prediction:
         self.net.eval()
+        # O5（V0.7）：灰度训练的模型推理前同样转灰（训练/推理同处理方式）
+        if getattr(self, "color_mode", "color") == "gray":
+            gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+            image_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         rgb = self._bgr_to_rgb(image_bgr)
         pil = Image.fromarray(rgb)
         x = self._transform(self._input_size)(pil).unsqueeze(0).to(self.device)
@@ -372,6 +384,7 @@ class ClassifierModel(BaseModel):
         self.num_classes = len(ckpt["classes"])
         self.classes = ckpt["classes"]
         self.industrial = ckpt.get("industrial_opt", False)
+        self.color_mode = ckpt.get("color_mode", "color")  # O5：推理侧同口径转灰
         restored = ckpt.get("image_size", self.default_image_size)
         if isinstance(restored, (list, tuple)):  # 非方形输入 (高, 宽)
             restored = (int(restored[0]), int(restored[1]))

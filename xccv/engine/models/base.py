@@ -72,6 +72,14 @@ class TrainConfig:
     bg_tile_keep: float = 0.15    # 无目标 tile 的保留率（负样本防刷屏）
     min_visibility: float = 0.3   # 裁剪后可见面积比低于此值的目标丢弃
     mix_full_view: float = 0.1    # 整图混入比例（防"只见局部"分布偏移）
+    # ---- 负样本（检测/分割全家族）----
+    use_negatives: bool = True    # 负样本文件夹（OK/良品/负样本/背景…）内未标注图作背景训练
+    # ---- YOLO 家族 ----
+    p2_head: bool = False         # P2 小目标检测头（stride 4 第四检测层；其他家族忽略）
+    # ---- O5（V0.7）颜色模式 ----
+    color_mode: str = "color"     # "color"=彩色（现状）；"gray"=训练读图转灰再复制 3 通道
+    # ---- E3（V0.7）确定性训练 ----
+    deterministic: bool = False   # opt-in：种子全集+确定性算法开关（同机同种子结果可复现）
 
 
 class TrainReporter:
@@ -99,6 +107,8 @@ class Prediction:
 
     分类任务填 labels/scores/probs；检测任务填 boxes/scores/labels；
     分割任务再填 masks（与 boxes 一一对应的布尔掩码）。
+    OCR 任务（A2，V0.7）填 boxes/scores + texts（与 boxes 一一对应的
+    识别文本；additive 契约，统一 JSON detections 同名透出）。
     """
 
     labels: list[int] = field(default_factory=list)
@@ -106,6 +116,7 @@ class Prediction:
     boxes: list[list[float]] = field(default_factory=list)  # xyxy 像素坐标
     masks: list | None = None           # list[np.ndarray(H, W) bool]
     probs: list[float] | None = None    # 分类任务：全部类别概率
+    texts: list[str] | None = None      # OCR 任务：逐框识别文本
 
 
 def _with_run_meta(metrics: dict, cfg: TrainConfig, started: datetime,
@@ -143,10 +154,41 @@ def _with_run_meta(metrics: dict, cfg: TrainConfig, started: datetime,
         "rcnn_learning_rate": cfg.rcnn_learning_rate,
         "rcnn_weight_decay": cfg.rcnn_weight_decay,
         "tf32": cfg.tf32, "save_epoch_weights": cfg.save_epoch_weights,
+        "use_negatives": bool(getattr(cfg, "use_negatives", True)),
+        "p2_head": bool(getattr(cfg, "p2_head", False)),
+        "color_mode": str(getattr(cfg, "color_mode", "color")),
+        "deterministic": bool(getattr(cfg, "deterministic", False)),
     }
     if error:
         metrics["error"] = error
     metrics.setdefault("history", [])
+
+
+def negative_fp_stats(predict_fn, val_samples, conf: float = 0.25) -> dict:
+    """验证集负样本（无标注的 OK 图）上的误检统计；无负样本时返回 {}。
+
+    neg_fp_per_img=平均每张 OK 图的误检框数；neg_fp_img_rate=出现误检的
+    OK 图占比（过检率）。predict_fn(image_bgr) -> Prediction，conf 为计数阈值。
+    """
+    from ..io_utils import imread_unicode
+
+    n_box = n_hit = seen = 0
+    for s in val_samples:
+        if s.shapes:
+            continue
+        img = imread_unicode(s.image_path)
+        if img is None:
+            continue
+        pred = predict_fn(img)
+        k = sum(1 for sc in (pred.scores or []) if float(sc) >= conf)
+        n_box += k
+        n_hit += 1 if k else 0
+        seen += 1
+    if not seen:
+        return {}
+    return {"neg_fp_per_img": round(n_box / seen, 3),
+            "neg_fp_img_rate": round(n_hit / seen, 4),
+            "neg_val_images": seen}
 
 
 class BaseModel(ABC):
@@ -193,6 +235,7 @@ class BaseModel(ABC):
                 multiply_factor=cfg.multiply_factor,
                 augment_ops=cfg.augment_ops,
                 augment_probs=cfg.augment_probs,
+                use_negatives=bool(getattr(cfg, "use_negatives", True)),
             )
             # 轮次权重存档：共用文件夹（output_dir 的上级 = 模型储存路径），
             # 数据准备成功后清空旧训练内容，本次训练逐轮覆盖写入
@@ -206,10 +249,29 @@ class BaseModel(ABC):
                     "轮次权重存档: %s（每轮保存，新训练自动覆盖）", self.epoch_store.dir)
             torch.manual_seed(cfg.seed)
             np.random.seed(cfg.seed)
+            import random as _random
+
+            _random.seed(cfg.seed)
+            if getattr(cfg, "deterministic", False):
+                # E3（V0.7）opt-in 确定性训练：种子全集 + 确定性算法开关。
+                # warn_only=True：个别算子不支持确定性实现时降级告警而非中断
+                # （VIMO FAQ"个别算子不支持"口径）；性能有损失，默认关。
+                import os as _os
+
+                _os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+                torch.use_deterministic_algorithms(True, warn_only=True)
+                torch.backends.cudnn.deterministic = True
+                torch.backends.cudnn.benchmark = False
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(cfg.seed)
             metrics = self.fit(data, cfg, reporter)
             _with_run_meta(metrics, cfg, started, datetime.now(),
                            status="interrupted" if reporter.stop_requested else "completed")
             save_json(cfg.output_dir / "metrics.json", metrics)
+            # E2（V0.7）：run_manifest.json（环境/数据指纹 + 完整参数快照）
+            from .manifest import write_run_manifest
+
+            write_run_manifest(cfg, metrics, cfg.output_dir)
             reporter.on_finish(True)
             return metrics
         except Exception as e:  # 训练失败要把原因带回界面，同时留档到历史记录

@@ -223,10 +223,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.canvas.aiModelReady.connect(
             lambda name: self._on_ai_model_ready(name))
         self.canvas.aiModelFailed.connect(
-            lambda msg: self.statusBar().showMessage(
-                f"AI 模型加载失败：{msg}", 10000))
+            lambda msg: self._on_ai_banner(None, f"AI 模型加载失败：{msg}"))
         self.canvas.aiStatus.connect(
-            lambda msg: self.statusBar().showMessage(msg, 5000))
+            lambda msg: self._on_ai_banner(msg, msg))
 
         self.setCentralWidget(scrollArea)
 
@@ -821,7 +820,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 quit,
             ),
         )
-        utils.addActions(self.menus.help, (help,))
+        # O10（V0.7）：标注质量引导 + 漏标复核（少量多次迭代原则的工具化）
+        act_label_tips = action(
+            self.tr("标注质量要点…"),
+            self._show_label_tips,
+            None,
+            None,
+            "应标尽标 / 紧贴边缘 / 不确定不入训 / OK 图目录约定 / 少量多次",
+        )
+        act_review_miss = action(
+            self.tr("AI 复核当前图（疑似漏标）…"),
+            self._review_missed_labels,
+            None,
+            None,
+            "用检测模型复核当前图：模型检出但人工未标的区域列出供确认",
+        )
+        utils.addActions(self.menus.help,
+                         (act_label_tips, act_review_miss, None, help))
         utils.addActions(
             self.menus.view,
             (
@@ -1169,7 +1184,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.toggleGrayscale()
 
     def _file_list_menu(self, pos):
-        """文件列表右键：打开所在文件夹（T5-6）。"""
+        """文件列表右键：打开所在文件夹（T5-6）+ 设为 OK 目录（O9，V0.7）。"""
         import subprocess
 
         item = self.fileListWidget.itemAt(pos)
@@ -1178,6 +1193,7 @@ class MainWindow(QtWidgets.QMainWindow):
         filename = str(item.data(0, QtCore.Qt.UserRole) or "")
         menu = QtWidgets.QMenu(self)
         act_open = menu.addAction(self.tr("Open Containing Folder"))
+        act_ok = menu.addAction(self.tr("把所在文件夹设为 OK/良品目录"))
         chosen = menu.exec_(self.fileListWidget.mapToGlobal(pos))
         if chosen is act_open and filename:
             folder = osp.dirname(filename)
@@ -1186,6 +1202,219 @@ class MainWindow(QtWidgets.QMainWindow):
                     os.startfile(folder)  # noqa: S606  资源管理器
                 else:
                     subprocess.Popen(["xdg-open", folder])
+        elif chosen is act_ok and filename:
+            self._mark_dir_as_ok(filename)
+
+    def _mark_dir_as_ok(self, filename: str):
+        """O9（V0.7）：把当前图片所在子文件夹重命名为 OK——训练侧
+        NEGATIVE_DIR_NAMES 同源规则，未标注图即刻成为负样本。"""
+        from PyQt5.QtWidgets import QMessageBox
+        from xccv.engine.dataset.reader import is_negative_dir_name
+
+        parent = osp.dirname(filename)
+        root = self.lastOpenDir or osp.dirname(parent)
+        if osp.normcase(osp.abspath(parent)) == osp.normcase(osp.abspath(root)):
+            QMessageBox.warning(
+                self, "设为 OK 目录",
+                "该图片在打开的根目录下——根目录不能重命名；"
+                "请把图片移入一个子文件夹后再标记。")
+            return
+        if is_negative_dir_name(osp.basename(parent)):
+            self.statusBar().showMessage("所在目录已经是 OK/良品目录", 6000)
+            return
+        target = osp.join(osp.dirname(parent), "OK")
+        n = 2
+        while osp.exists(target):
+            target = osp.join(osp.dirname(parent), f"OK_{n}")
+            n += 1
+        ret = QMessageBox.question(
+            self, "设为 OK 目录",
+            f"把文件夹「{osp.basename(parent)}」重命名为 "
+            f"「{osp.basename(target)}」？\n"
+            "重命名后：该文件夹内未标注的图片将作为 OK 负样本参与训练。")
+        if ret != QMessageBox.Yes:
+            return
+        try:
+            os.rename(parent, target)
+        except OSError as e:
+            QMessageBox.critical(self, "设为 OK 目录", f"重命名失败：{e}")
+            return
+        self.statusBar().showMessage(
+            f"已设为 OK 目录：{target}（未标注图将作为负样本参与训练）", 10000)
+        if self.lastOpenDir and osp.isdir(self.lastOpenDir):
+            self.importDirImages(self.lastOpenDir, load=False)  # 刷新徽标
+
+    # ---- O10（V0.7）：标注质量引导 + 漏标复核 ----
+    def _show_label_tips(self):
+        from PyQt5.QtWidgets import QDialog, QDialogButtonBox, QLabel, \
+            QTextEdit, QVBoxLayout
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("标注质量要点")
+        lay = QVBoxLayout(dlg)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(
+            "高质量标注五要点（对照工业标注方法论，XCcv 版）：\n\n"
+            "1. 应标尽标：画面里所有目标实例都标上——漏标的实例会被当成"
+            "背景，直接教错模型；\n\n"
+            "2. 紧贴边缘：框/多边形紧贴目标真实边界，不要框到一大片背景"
+            "（检测框内背景不超过 1/3）；分割用 AI 智能多边形（S 键）描边。\n\n"
+            "3. 不确定不入训：难以分辨是否缺陷的图片不要勉强标注——"
+            "宁可移出训练集或人工复核后再标。\n\n"
+            "4. OK 图用目录约定：把良品图放进名为 OK/良品/正常/合格 的"
+            "文件夹（无需标注），训练时勾选「负样本训练」即可压误检；\n"
+            "OK 与缺陷数量建议约 1:1~1:2（数据体检会提示偏离）。\n\n"
+            "5. 少量多次：先标 30~50 张快速训练一版，看逐类指标和误检，"
+            "再针对性补标难例（「AI 复核当前图」可辅助找漏标）——"
+            "多轮小步迭代胜过一次性大量标注。\n\n"
+            "配套工具：数据体检（训练平台）·逐类指标表（训练完成页）·"
+            "分数分布与阈值拖线（测试平台批量）·漏标复核（本菜单）。")
+        lay.addWidget(text)
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(dlg.reject)
+        btns.clicked.connect(lambda *_: dlg.close())
+        lay.addWidget(btns)
+        dlg.resize(560, 480)
+        dlg.exec_()
+
+    def _review_missed_labels(self):
+        """AI 复核当前图：检测模型检出但人工未标的区域 → 列表确认后可一键接受。"""
+        from PyQt5.QtCore import Qt as _Qt, QThread, pyqtSignal
+        from PyQt5.QtWidgets import (QDialog, QDialogButtonBox, QFileDialog,
+                                     QHBoxLayout, QHeaderView, QLabel,
+                                     QMessageBox, QProgressDialog,
+                                     QPushButton, QTableWidget,
+                                     QTableWidgetItem, QVBoxLayout)
+
+        if self.filename is None:
+            QMessageBox.information(self, "漏标复核", "请先打开一张图片")
+            return
+        # 权重记忆（ui_prefs：ai.review_model——上次复核用的检测权重）
+        from xccv.ui_widgets import load_prefs, save_prefs
+
+        prefs = load_prefs()
+        last = str(prefs.get("ai.review_model") or "")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择检测模型权重（复核用；下次自动记住）", last,
+            "权重 (*.pt)")
+        if not path:
+            return
+        prefs["ai.review_model"] = path
+        save_prefs(prefs)
+        image_path = str(self.filename)
+        shapes = [sh.points for sh in self.canvas.shapes]
+
+        class _ReviewThread(QThread):
+            done = pyqtSignal(object)
+            failed = pyqtSignal(str)
+
+            def __init__(self, parent=None):
+                super().__init__(parent)
+
+            def run(self):
+                try:
+                    from xccv.engine.io_utils import imread_unicode
+                    from xccv.engine.models import load_model
+
+                    img = imread_unicode(image_path)
+                    model = load_model(path, device="auto")
+                    pred = model.predict(img, conf=0.25, iou=0.45)
+                    self.done.emit({
+                        "boxes": [list(map(float, b)) for b in pred.boxes],
+                        "scores": [float(s) for s in pred.scores],
+                        "labels": list(pred.labels),
+                        "classes": list(model.classes or []),
+                        "size": (img.shape[1], img.shape[0]),
+                    })
+                except Exception as e:  # noqa: BLE001
+                    self.failed.emit(f"{type(e).__name__}: {e}")
+
+        def _covered(box) -> bool:
+            """与任一已标注形状的重叠超 10% 即视为已标（按框交并比口径）。"""
+            from xccv.engine.metrics.detection import iou_matrix
+
+            x1, y1, x2, y2 = box
+            xs = [p[0] for p in points] if False else None
+            return False
+
+        self._review_thread = _ReviewThread(self)
+
+        def _on_done(info):
+            from xccv.engine.metrics.detection import iou_matrix
+            import numpy as np
+
+            # 已标注形状的外接框（与任一标注 IoU>0.1 即视为已标）
+            gt_boxes = []
+            for pts in shapes:
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                gt_boxes.append([min(xs), min(ys), max(xs), max(ys)])
+            suspects = []
+            for box, score, lid in zip(info["boxes"], info["scores"],
+                                       info["labels"]):
+                ious = iou_matrix(np.asarray([box], float),
+                                  np.asarray(gt_boxes, float).reshape(-1, 4)) \
+                    if gt_boxes else np.zeros((1, 0))
+                if ious.size and float(ious.max()) > 0.1:
+                    continue   # 与已有标注重叠 → 不算漏标
+                cls = (info["classes"][lid]
+                       if lid < len(info["classes"]) else str(lid))
+                suspects.append((cls, score, box))
+            if not suspects:
+                QMessageBox.information(
+                    self, "漏标复核",
+                    "未发现疑似漏标：模型检出均与已有标注重叠，"
+                    "或当前权重无检出。")
+                return
+            dlg = QDialog(self)
+            dlg.setWindowTitle(f"疑似漏标 {len(suspects)} 处")
+            lay = QVBoxLayout(dlg)
+            lay.addWidget(QLabel(
+                "以下是模型检出但与当前标注不重叠的区域（IoU<0.1 口径）。"
+                "逐条人工确认：确属漏标的勾选后接受，误检的不勾选即可。"))
+            table = QTableWidget(0, 4)
+            table.setHorizontalHeaderLabels(["接受", "类别", "置信度", "位置"])
+            table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+            for cls, score, box in suspects:
+                r = table.rowCount()
+                table.insertRow(r)
+                item = QTableWidgetItem()
+                item.setCheckState(_Qt.Checked)
+                table.setItem(r, 0, item)
+                table.setItem(r, 1, QTableWidgetItem(str(cls)))
+                table.setItem(r, 2, QTableWidgetItem(f"{score:.2f}"))
+                table.setItem(r, 3, QTableWidgetItem(
+                    f"({box[0]:.0f},{box[1]:.0f})-({box[2]:.0f},{box[3]:.0f})"))
+            lay.addWidget(table)
+            btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            btns.button(QDialogButtonBox.Ok).setText("接受勾选为标注")
+            btns.accepted.connect(dlg.accept)
+            btns.rejected.connect(dlg.reject)
+            lay.addWidget(btns)
+            dlg.resize(560, 420)
+            if dlg.exec_() != QDialog.Accepted:
+                return
+            added = 0
+            for r in range(table.rowCount()):
+                if table.item(r, 0).checkState() != _Qt.Checked:
+                    continue
+                cls = table.item(r, 1).text()
+                box = suspects[r][2]
+                sh = Shape(label=str(cls), shape_type="rectangle")
+                sh.points = [[box[0], box[1]], [box[2], box[3]]]
+                self.canvas.shapes.append(sh)
+                added += 1
+            if added:
+                self.setDirty(True)
+                self.canvas.update()
+                self.statusBar().showMessage(
+                    f"已接受 {added} 处疑似漏标为矩形标注（保存前请复核）", 10000)
+
+        self._review_thread.done.connect(_on_done)
+        self._review_thread.failed.connect(
+            lambda m: QMessageBox.warning(self, "漏标复核失败", m))
+        self._review_thread.start()
 
     def _init_ai_model(self):
         """T5-3：智能多边形进入前初始化 SAM（权重缺失=动作提示，不进入）。"""
@@ -1342,6 +1571,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_ai_model_ready(self, name):
         self.canvas._apply_pending_model(name)
+        self._on_ai_banner(None, None)   # 加载完成：收起顶部等待横幅
         want = self._selected_ai_model()
         if want and want != name:
             # 加载期间用户又换了模型：继续加载最新所选
@@ -1350,6 +1580,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(
             f"AI 智能多边形已就绪（{name}）：左键并入 / Shift+左键挖除 / "
             "右键撤销 / 双击或 Ctrl+左键完成", 8000)
+
+    def _on_ai_banner(self, wait_msg, done_msg):
+        """AI 等待状态顶部横幅（第四批：模型加载/推理等待有可见提示）。
+
+        wait_msg 含「加载中/稍候/推理」→ 顶部居中悬浮横幅持续显示（用户
+        不再因无反馈而重复点击）；就绪/失败/普通消息 → 横幅收起，重要
+        结论走状态栏。done_msg 为失败文本时同时状态栏展示。
+        """
+        from PyQt5.QtCore import Qt
+
+        banner = getattr(self, "_ai_banner", None)
+        if banner is None:
+            banner = QtWidgets.QLabel(self)
+            banner.setObjectName("aiWaitBanner")
+            banner.setVisible(False)
+            banner.setStyleSheet(
+                "QLabel#aiWaitBanner { background: #B45309; color: white;"
+                " padding: 6px 18px; border-radius: 12px;"
+                " font-weight: bold; font-size: 13px; }")
+            self._ai_banner = banner
+        if done_msg and ("失败" in done_msg):
+            self.statusBar().showMessage(done_msg, 10000)
+        show = bool(wait_msg) and any(
+            k in wait_msg for k in ("加载中", "稍候", "推理"))
+        if not show:
+            banner.setVisible(False)
+            return
+        banner.setText(wait_msg)
+        banner.adjustSize()
+        banner.move((self.width() - banner.width()) // 2, 12)
+        banner.raise_()
+        banner.setVisible(True)
 
     # ---- AI 模型选择与参数（第二批：用户可选模型、可调参数，持久化）----
     _AI_DEFAULTS = {
@@ -1696,7 +1958,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.canvas.storeShapes()
         for item in items:
-            shape: Shape = item.shape()
+            shape = item.shape()
 
             if edit_text:
                 shape.label = text
@@ -2818,6 +3080,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 item.setCheckState(0, Qt.Checked)
             else:
                 item.setCheckState(0, Qt.Unchecked)
+                # O9（V0.7）：OK/良品目录内的未标注图加 [OK] 徽标（与训练侧
+                # NEGATIVE_DIR_NAMES 同源——负样本利用情况可见）
+                try:
+                    from xccv.engine.dataset.reader import is_negative_dir_name
+
+                    rel_dir = osp.dirname(osp.relpath(filename, dirpath))
+                    parts = [p for p in rel_dir.replace("\\", "/").split("/")
+                             if p not in (".", "")]
+                    if parts and any(is_negative_dir_name(p) for p in parts):
+                        item.setText(0, f"{osp.basename(filename)}　[OK]")
+                        item.setForeground(0, QtGui.QBrush(QtGui.QColor("#2E9E5B")))
+                except Exception:
+                    pass
             self._file_items[filename] = item
             self._file_order.append(filename)
             return item

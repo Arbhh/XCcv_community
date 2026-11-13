@@ -8,7 +8,7 @@
 - XccvYoloTrainer：覆盖 ultralytics 的数据装配（get_dataset / get_dataloader）
   与模型装配（get_model 支持从剪枝模型恢复），训练全程不产生 data.yaml；
 - 训练产物（best/last 权重、args.yaml、results.csv）属于输出而非数据，
-  仍写入训练输出目录，由 YoloModel 负责加密与清理明文权重。
+  仍写入训练输出目录，由 YoloModel 负责清理中间权重。
 """
 
 import logging
@@ -25,6 +25,7 @@ from ultralytics.utils import colorstr
 from ultralytics.utils.torch_utils import unwrap_model
 
 from ..dataset.converters import _clipped_bbox, _seg_points
+from ..dataset.ignore import IGNORE_LABEL
 from ..dataset.transforms import maybe_apply_ops
 from ..io_utils import imread_unicode
 
@@ -36,6 +37,8 @@ def build_labels_from_shapes(shapes: list, classes: list[str], task: str,
     """把变换后的平台 Shape 列表转成 ultralytics 标签字典（增强后重建用）。"""
     cls_list, boxes, segments = [], [], []
     for sh in shapes:
+        if sh.label == IGNORE_LABEL:  # O8：忽略区域不是训练目标（防御兜底）
+            continue
         ci = classes.index(sh.label) if sh.label in classes else -1
         if ci < 0:
             continue
@@ -80,11 +83,17 @@ class InMemoryYoloDataset(YOLODataset):
     """ultralytics YOLODataset 的内存版：标签内存构造、原图直读、在线增强。"""
 
     def __init__(self, samples, classes: list[str], task: str, augment_ops: dict | None,
-                 *args, augment_probs: dict | None = None, **kwargs):
+                 *args, augment_probs: dict | None = None, grayscale: bool = False,
+                 **kwargs):
         self._samples = list(samples)
         self._classes = list(classes)
         self._task = task  # 平台任务名：detection / segmentation
-        self._ops = dict(augment_ops or {})
+        self._gray = bool(grayscale)  # O5（V0.7）：灰度训练读图口径
+        # resize 宽高对 YOLO 只决定网络输入尺寸（fit 取长边作 imgsz）；其
+        # 非等比拉伸不进训练——混合长宽比数据集被拉到同一宽高会让训练几何
+        # 偏离验证/推理（原图长宽比 + letterbox）
+        self._ops = {k: v for k, v in dict(augment_ops or {}).items()
+                     if k != "resize"}
         self._probs = dict(augment_probs or {})
         ul_task = {"segmentation": "segment"}.get(task, task)  # ultralytics 任务名
         super().__init__(*args, task=ul_task, **kwargs)
@@ -103,7 +112,7 @@ class InMemoryYoloDataset(YOLODataset):
         return labels
 
     def _read_original(self, index: int) -> np.ndarray:
-        im = imread_unicode(self.im_files[index])
+        im = imread_unicode(self.im_files[index], color=not self._gray)
         if im is None:
             raise FileNotFoundError(f"Image Not Found {self.im_files[index]}")
         return im
@@ -132,14 +141,14 @@ class InMemoryYoloDataset(YOLODataset):
             label = deepcopy(self.labels[index])
         label.pop("shape", None)  # shape 仅供 rect 使用，与父类一致移除
         h0, w0 = im.shape[:2]
-        if self.rect:  # 长边缩放到 imgsz，保持长宽比（val letterbox 由 collate 补边）
-            r = self.imgsz / max(h0, w0)
-            if r != 1:
-                w, h = (min(math.ceil(w0 * r), self.imgsz),
-                        min(math.ceil(h0 * r), self.imgsz))
-                im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
-        elif not (h0 == w0 == self.imgsz):
-            im = cv2.resize(im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+        # 训练与验证统一：长边缩放到 imgsz、保持长宽比。拉伸成 imgsz 方形
+        # 会让框高宽比非等比失真（实测 ×4），与验证/推理的 letterbox 几何
+        # 不一致，小目标模型学到的是被拉高的形状。
+        r = self.imgsz / max(h0, w0)
+        if r != 1:
+            w, h = (min(math.ceil(w0 * r), self.imgsz),
+                    min(math.ceil(h0 * r), self.imgsz))
+            im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
         if im.ndim == 2:
             im = im[..., None]
         label["img"], label["ori_shape"], label["resized_shape"] = im, (h0, w0), im.shape[:2]
@@ -151,18 +160,15 @@ class InMemoryYoloDataset(YOLODataset):
             label["rect_shape"] = self.batch_shapes[self.batch[index]]
         return self.update_labels_info(label)
 
-    def load_image(self, i: int, rect_mode: bool = True):
-        """读原图并按矩形模式缩放（增强已移入 get_image_and_label 同步标签）。"""
+    def load_image(self, i: int, rect_mode: bool = True):  # noqa: ARG002
+        """读原图并长边缩放到 imgsz（保持长宽比，与 get_image_and_label 同一几何）。"""
         im = self._read_original(i)
         h0, w0 = im.shape[:2]
-        if rect_mode:  # 长边缩放到 imgsz，保持长宽比
-            r = self.imgsz / max(h0, w0)
-            if r != 1:
-                w, h = (min(math.ceil(w0 * r), self.imgsz),
-                        min(math.ceil(h0 * r), self.imgsz))
-                im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
-        elif not (h0 == w0 == self.imgsz):
-            im = cv2.resize(im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+        r = self.imgsz / max(h0, w0)
+        if r != 1:
+            w, h = (min(math.ceil(w0 * r), self.imgsz),
+                    min(math.ceil(h0 * r), self.imgsz))
+            im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
         if im.ndim == 2:
             im = im[..., None]
         return im, (h0, w0), im.shape[:2]
@@ -196,6 +202,7 @@ def make_yolo_trainer(task: str):
                 self._xccv_samples[split], self._xccv_classes, self._xccv_task,
                 self._xccv_ops if mode == "train" else None,
                 augment_probs=self._xccv_probs if mode == "train" else None,
+                grayscale=getattr(type(self), "_xccv_gray", False),
                 img_path="xccv://in-memory", imgsz=self.args.imgsz,
                 batch_size=batch_size, augment=mode == "train", hyp=self.args,
                 rect=mode == "val", cache=None, single_cls=False, stride=gs,

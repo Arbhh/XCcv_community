@@ -24,8 +24,9 @@ from ..dataset.converters import _clipped_bbox, _seg_points
 from ..dataset.transforms import maybe_apply_ops
 from ..io_utils import imread_unicode
 from ..metrics.detection import detection_confusion_matrix
+from ..metrics.per_class import coco_per_class_ap50
 from .modules import CBAM, replace_convs_with_dcn
-from .base import BaseModel, Prediction, TrainConfig, TrainReporter
+from .base import BaseModel, Prediction, TrainConfig, TrainReporter, negative_fp_stats
 
 log = logging.getLogger(__name__)
 
@@ -42,12 +43,13 @@ class RcnnDataset(Dataset):
     def __init__(self, samples, classes: list[str], task: TaskType,
                  augment_ops: dict | None = None, train: bool = True,
                  augment_probs: dict | None = None,
-                 tiling: dict | None = None):
+                 tiling: dict | None = None, grayscale: bool = False):
         self.classes = list(classes)
         self.with_masks = task is TaskType.SEGMENTATION
         self.ops = dict(augment_ops) if (train and augment_ops) else None
         self.op_probs = dict(augment_probs or {})
         self.samples = list(samples)
+        self._grayscale = bool(grayscale)  # O5（V0.7）：灰度训练（读图转灰再复制 3 通道）
         # T9-3 切图训练（opt-in）：预生成 (样本, x, y) 索引现场裁剪、不落盘；
         # 验证集不传 tiling（始终整图评估）
         tiling = dict(tiling) if (train and tiling) else None
@@ -68,11 +70,15 @@ class RcnnDataset(Dataset):
         return (len(self._entries) if self._entries is not None
                 else len(self.samples))
 
+    def _read(self, path):
+        """读图（O5：灰度模式转灰再复制 3 通道，下游增强/张量化零改动）。"""
+        return imread_unicode(path, color=not self._grayscale)
+
     def __getitem__(self, index: int):
         if self._entries is not None:
             return self._getitem_tiled(index)
         s = self.samples[index]
-        img = imread_unicode(s.image_path)
+        img = self._read(s.image_path)
         if img is None:
             raise FileNotFoundError(f"无法读取图片: {s.image_path}")
         shapes = list(s.shapes)
@@ -119,7 +125,7 @@ class RcnnDataset(Dataset):
         框只归中心所在的第一个窗口，跨 tile 不重复）。x/y 为 None=整图混入。"""
         e = self._entries[index]
         s = self.samples[e.sample_idx]
-        img = imread_unicode(s.image_path)
+        img = self._read(s.image_path)
         if img is None:
             raise FileNotFoundError(f"无法读取图片: {s.image_path}")
         shapes = list(s.shapes)
@@ -812,7 +818,8 @@ class RCNNModel(BaseModel):
             train_set = RcnnDataset(data.train_samples, data.classes, self.task,
                                     cfg.augment_ops, train=True,
                                     augment_probs=cfg.augment_probs,
-                                    tiling=tiling_cfg)
+                                    tiling=tiling_cfg,
+                                    grayscale=getattr(cfg, "color_mode", "color") == "gray")
             # 切图训练：tile 按原尺度入网（网络变换尺寸=tile），验证/保存仍按画布
             # 尺寸——原先 tile 被网络变换放大到画布短边（640 tile ×3 放大），训练与
             # 整图评估尺度错位（E4 切图实验 0.156 的根因）
@@ -827,8 +834,11 @@ class RCNNModel(BaseModel):
                          "请配合分块推理）", cfg.tile_size, cfg.tile_overlap,
                          cfg.bg_tile_keep, cfg.min_visibility,
                          cfg.mix_full_view, len(train_set))
-            val_set = RcnnDataset(data.val_samples, data.classes, self.task, train=False)
+            val_set = RcnnDataset(data.val_samples, data.classes, self.task,
+                                  train=False,
+                                  grayscale=getattr(cfg, "color_mode", "color") == "gray")
             val_set.coco = memory_coco(data.val_samples, data.classes, self.task.value)
+            self.color_mode = getattr(cfg, "color_mode", "color")  # O5：评估/混淆矩阵同口径
             # 混合精度：GPU 上启用（缩短训练时间），CPU 自动关闭（界面可控）
             use_amp = cfg.use_amp and self.device == "cuda"
             # 显存预算：预估超出空闲显存时先启用梯度检查点（激活省约 60%），
@@ -858,9 +868,12 @@ class RCNNModel(BaseModel):
                      f"（物理批次按显存预算由 {cfg.batch_size} 下调）" if bs < cfg.batch_size else "",
                      "开" if need_ckpt else "关")
             pin = self.device == "cuda"
+            gen = (torch.Generator().manual_seed(cfg.seed)
+                   if getattr(cfg, "deterministic", False) else None)  # E3（V0.7）
             loader = DataLoader(train_set, batch_size=bs, shuffle=True,
                                 num_workers=cfg.workers, collate_fn=_collate,
                                 pin_memory=pin,
+                                generator=gen,
                                 persistent_workers=(cfg.workers > 0))
             # 验证固定 batch=1：postprocess 会按原图尺寸给每条检出贴 mask，
             # 大图 × 批内多条检出同时驻留显存极易 OOM（详见 training.log 09-09 案例）
@@ -1015,12 +1028,16 @@ class RCNNModel(BaseModel):
                 "anchor_base": anchor_used,
                 # T10-3 联动：部署侧读 meta 决定推理口径（0=跟随画布）
                 "train_input": applied_input,
+                # O5（V0.7）：灰度训练标记随权重走（load_weights/predict 同口径）
+                "color_mode": getattr(cfg, "color_mode", "color"),
             }
             if cfg.resume_from_pruned:
                 best_ckpt["net_module"] = self.net  # 剪后网络结构随文件保存
             torch.save(best_ckpt, best_pt)
 
             final = self._eval_coco(vloader)
+            final.update(negative_fp_stats(
+                lambda im: self.predict(im, conf=0.25), data.val_samples))
             if ckpt_patches:
                 _restore_grad_checkpoint(ckpt_patches)  # 保存 net_module 前摘除闭包补丁
             if cfg.industrial_opt:
@@ -1045,6 +1062,7 @@ class RCNNModel(BaseModel):
                                                           "maskrcnn18")),
                 "trainable_params": sum(p.numel() for p in self.net.parameters() if p.requires_grad),
                 "early_stopped": early_stopped,
+                "neg_train_images": int(getattr(data, "neg_train_count", 0)),
                 "history": history,
                 "confusion_matrix": self._confusion_matrix(data),
                 "classes": data.classes,
@@ -1085,6 +1103,7 @@ class RCNNModel(BaseModel):
         if not dets:
             out = {"map50": 0.0, "map50_95": 0.0,
                    "map_loose": 0.0, "map10": 0.0, "map25": 0.0, "mar_loose": 0.0}
+            out["per_class_ap50"] = []  # O1：无检出无逐类 AP
             if self.with_masks:
                 out.update(mask_map50=0.0, mask_map50_95=0.0)
             return out
@@ -1118,6 +1137,7 @@ class RCNNModel(BaseModel):
         # precision/recall 数组（area=all、maxDets=100）
         if ev.eval is None:  # 无有效评估组合（如验证集无 GT）
             out.update(map_loose=0.0, map10=0.0, map25=0.0, mar_loose=0.0)
+            out["per_class_ap50"] = []
             return out
         prec = ev.eval["precision"]  # [T,R,K,A,M]
         rec = ev.eval["recall"]      # [T,K,A,M]
@@ -1132,6 +1152,9 @@ class RCNNModel(BaseModel):
         out["map25"] = _sane(aps[1])
         out["map_loose"] = _sane(sum(aps) / 3.0)
         out["mar_loose"] = _sane(sum(ars) / 3.0)
+        # O1（V0.7）：逐类 AP@50——取宽松评估数组 IoU 0.50 档（area=all、
+        # maxDets=末档，与标准 map50 同口径），仅 additive 不影响既有键
+        out["per_class_ap50"] = coco_per_class_ap50(prec)
         return out
 
     def _collect_detections(self, vloader) -> list:
@@ -1158,9 +1181,10 @@ class RCNNModel(BaseModel):
 
     def _confusion_matrix(self, data, conf: float = 0.25, iou: float = 0.5) -> list:
         """用最终权重在内存验证集上做 IoU 匹配统计。"""
+        gray = getattr(self, "color_mode", "color") == "gray"
         per_gt, per_pred = [], []
         for s in data.val_samples:
-            img = imread_unicode(s.image_path)
+            img = imread_unicode(s.image_path, color=not gray)
             if img is None:
                 continue
             gt_boxes, gt_labels = [], []
@@ -1180,6 +1204,11 @@ class RCNNModel(BaseModel):
     @torch.no_grad()
     def predict(self, image_bgr: np.ndarray, conf: float = 0.25, iou: float = 0.45) -> Prediction:
         self.net.eval()
+        # O5（V0.7）：灰度训练的模型推理前同样转灰（训练/推理同处理方式，
+        # VIMO"SDK 效果与平台不符"第 3 因的防御）
+        if getattr(self, "color_mode", "color") == "gray":
+            gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+            image_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         # 注意属性名是 score_thresh / nms_thresh（box_score_thresh 只是构造参数名）
         self.net.roi_heads.score_thresh = conf
         self.net.roi_heads.nms_thresh = iou
@@ -1212,6 +1241,7 @@ class RCNNModel(BaseModel):
         self.classes = ckpt["classes"]
         self.industrial = ckpt.get("industrial_opt", False)
         self.mask_head_light = ckpt.get("mask_head_light", False)  # 供引擎导出透传
+        self.color_mode = ckpt.get("color_mode", "color")  # O5：推理侧同口径转灰
         self._min_size = ckpt.get("min_size", self.default_image_size)
         if "net_module" in ckpt:  # 模型工具剪枝后的整网结构：直接取用
             self.net = ckpt["net_module"]

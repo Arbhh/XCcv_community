@@ -37,9 +37,14 @@ def classification_topk(prediction, classes: list, k: int = _TOPK) -> list:
 
 def detection_rows(prediction, classes: list) -> list:
     """Prediction → detections 数组（build_result_json 与流程出口/批量收集器
-    共用的单一实现，保证各链路 schema 一致；含掩码面积）。"""
+    共用的单一实现，保证各链路 schema 一致；含掩码面积）。
+
+    OCR 任务（A2，V0.7）：prediction.texts 存在时逐框透出 "text" 键
+    （additive，schema 只增不改）。
+    """
     classes = list(classes or [])
     masks = getattr(prediction, "masks", None)
+    texts = getattr(prediction, "texts", None)
     rows = []
     boxes = getattr(prediction, "boxes", None)
     boxes = [] if boxes is None else boxes   # 判空不用真值（ndarray 歧义，P150）
@@ -55,6 +60,8 @@ def detection_rows(prediction, classes: list) -> list:
                "bbox_area": int(round(abs(x2 - x1) * abs(y2 - y1)))}
         if masks is not None and i < len(masks):
             row["mask_area"] = int(masks[i].sum())
+        if texts is not None and i < len(texts):
+            row["text"] = str(texts[i])
         rows.append(row)
     return rows
 
@@ -84,7 +91,13 @@ def build_result_json(*, task, source: dict, model: dict | None = None,
     detections: list = []
     classifications: list = []
     if prediction is not None:
-        if task_v == "classification":
+        probs = list(getattr(prediction, "probs", None) or [])
+        boxes = getattr(prediction, "boxes", None)
+        boxes = [] if boxes is None else boxes   # 判空不用真值（ndarray 歧义，P150）
+        # 分类样预测（携带类别概率且无检出框）按分类口径导出——流程链
+        # task="flow" 的分类模型此前走 detections 分支，classifications
+        # 恒为空（第五批用户复现：resnet18 九色分类 json 空）
+        if task_v == "classification" or (probs and not boxes):
             classifications = classification_topk(prediction, classes)
         else:
             detections = detection_rows(prediction, classes)
@@ -306,11 +319,22 @@ def batch_summary(results: list, costs_ms: list | None = None) -> dict:
         e["avg_score"] = round(s / e["count"], 4) if e["count"] else 0.0
     costs = sorted(float(v) for v in (costs_ms or []))
     latency = None
+    slow_outliers = None
     if costs:
-        latency = {"p50_ms": round(statistics.median(costs), 1),
+        # O13（V0.7）：min/avg 补齐（VIMO 推理页口径：最小/平均/最大耗时）
+        latency = {"min_ms": round(costs[0], 1),
+                   "p50_ms": round(statistics.median(costs), 1),
+                   "avg_ms": round(sum(costs) / len(costs), 1),
                    "max_ms": round(costs[-1], 1)}
+        # O15（V0.7）：耗时离散度——单图耗时 > 中位数×3 视为疑似 GPU
+        # 掉频/热节流信号（VIMO 显卡掉频专项口径）
+        med = statistics.median(costs)
+        n_out = sum(1 for c in costs if c > med * 3)
+        slow_outliers = {"count": n_out, "median_ms": round(med, 1),
+                         "threshold_ms": round(med * 3, 1)}
     return {"images": len(results), "detections": total,
-            "per_class": per_class, "latency_ms": latency}
+            "per_class": per_class, "latency_ms": latency,
+            "slow_outliers": slow_outliers}
 
 
 def save_result_json(path, payload: dict) -> None:

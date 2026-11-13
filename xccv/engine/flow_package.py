@@ -1,7 +1,7 @@
 """流程图打包格式 .xvap（社区版：明文容器）：流程图（节点/连线/参数，含所选
 模型引用）+ 引用的模型文件本体，打包为单一 .xvap 文件。
 
-payload 布局（未加密态）：
+payload 布局：
     b"XVAP" + <I json 长度> + <I 模型个数>
     + JSON（流程图：nodes/links/参数；模型节点记录 model_file 文件名）
     + 每个模型: <H 文件名长> 文件名 <I 数据长> 数据（模型文件原字节）
@@ -28,7 +28,7 @@ def _model_refs(node: dict) -> list[tuple[str, str]]:
 
 
 def pack_xvap(flow: dict, models: dict[str, bytes]) -> bytes:
-    """流程图 + 模型文件字节 → .xvap 明文 payload（调用方负责加密落盘）。"""
+    """流程图 + 模型文件字节 → .xvap 明文 payload（调用方直接落盘）。"""
     flow_b = json.dumps(flow, ensure_ascii=False).encode("utf-8")
     parts = [_MAGIC, struct.pack("<II", len(flow_b), len(models)), flow_b]
     for name, data in models.items():

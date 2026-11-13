@@ -7,8 +7,10 @@ from pathlib import Path
 import torch
 
 from ..dataset.base import TaskType
+from .anomaly import AnomalyModel
 from .base import BaseModel
 from .classifier import ClassifierModel
+from .ocr import OcrModel
 from .rcnn import RCNNModel
 from .yolo import YoloModel
 
@@ -36,6 +38,12 @@ MODEL_SPECS: dict[str, tuple] = {
                  lambda task, n, dev, pre: RCNNModel("maskrcnn", TaskType.SEGMENTATION, n, dev, pre)),
     "maskrcnn18": (TaskType.SEGMENTATION, "Mask R-CNN 实例分割（ResNet18 轻量）",
                    lambda task, n, dev, pre: RCNNModel("maskrcnn18", TaskType.SEGMENTATION, n, dev, pre)),
+    # A1（V0.7）：无监督异常检测（OK 图训练 + 热力图/连通域检出）
+    "patchcore": (TaskType.ANOMALY, "PatchCore 异常检测（无监督，OK 图训练）",
+                  lambda task, n, dev, pre: AnomalyModel(n, dev, pre)),
+    # A2（V0.7）：OCR 字符识别（CRNN+CTC；rectangle 标注、label=文本内容）
+    "crnn": (TaskType.OCR, "CRNN 字符识别（OCR，行文本）",
+             lambda task, n, dev, pre: OcrModel(n, dev, pre)),
 }
 
 
@@ -86,6 +94,18 @@ def load_model(weights_path: Path, device: str = "auto") -> BaseModel:
         log.info("格式: xccv-rcnn (arch=%s, task=%s, 加载耗时 %.1fs)",
                  ckpt.get("arch"), ckpt.get("task"), time.perf_counter() - t0)
         model = RCNNModel("fasterrcnn", TaskType.DETECTION, 1, device, use_pretrained=False)
+        model.load_weights(ckpt)
+        return model
+    if isinstance(ckpt, dict) and ckpt.get("format") == "xccv-anomaly":
+        log.info("格式: xccv-anomaly (记忆库 %s patch, 加载耗时 %.1fs)",
+                 getattr(ckpt.get("memory"), "shape", "?"), time.perf_counter() - t0)
+        model = AnomalyModel(1, device, use_pretrained=False)
+        model.load_weights(ckpt)
+        return model
+    if isinstance(ckpt, dict) and ckpt.get("format") == "xccv-ocr":
+        log.info("格式: xccv-ocr (字符集 %d, 加载耗时 %.1fs)",
+                 len(ckpt.get("charset") or []), time.perf_counter() - t0)
+        model = OcrModel(1, device, use_pretrained=False)
         model.load_weights(ckpt)
         return model
     log.info("格式: ultralytics YOLO (加载耗时 %.1fs)", time.perf_counter() - t0)

@@ -43,7 +43,7 @@ def load_all() -> None:
     注册（懒加载同一时机）；之后由工作台「刷新」显式热重载。
     """
     from . import (  # noqa: F401
-        ai_bridge, crop, listops, logic, output, source,
+        ai_bridge, crop, det_filters, listops, logic, output, source,
     )
     from .. import custom_ops
 

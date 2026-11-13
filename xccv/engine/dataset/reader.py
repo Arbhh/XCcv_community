@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ..io_utils import read_json
 from .base import IMAGE_EXTS, Sample, Shape, image_size
+from .ignore import IGNORE_LABEL
 
 # labelme 中参与本平台任务的形状，其余（line/point 等）忽略
 SUPPORTED_SHAPE_TYPES = {"rectangle", "polygon"}
@@ -71,13 +72,55 @@ def scan_labelme_dataset(dataset_dir: Path) -> tuple[list[Sample], list[str], bo
         classes = [
             line.strip()
             for line in classes_file.read_text(encoding="utf-8").splitlines()
-            if line.strip()
+            if line.strip() and line.strip() != IGNORE_LABEL
         ]
         from_file = True
     else:
-        classes = sorted({s.label for sample in samples for s in sample.shapes})
+        # O8（V0.7）：`__ignore__` 是忽略区域标记不是类别，永不进类别表
+        classes = sorted({s.label for sample in samples for s in sample.shapes
+                          if s.label != IGNORE_LABEL})
         from_file = False
     return samples, classes, from_file
+
+
+# 负样本文件夹名（不区分大小写）：其中【未标注】的图片作纯背景样本参与训练。
+# 只认显式命名的文件夹——缺陷目录里尚未标注的图可能含真实缺陷，当负样本
+# 会教模型把缺陷当背景。
+NEGATIVE_DIR_NAMES = frozenset({
+    "ok", "good", "良品", "正常", "合格", "负样本", "背景",
+    "negative", "negatives", "background", "bg",
+})
+
+
+def is_negative_dir_name(name: str) -> bool:
+    return name.strip().lower() in NEGATIVE_DIR_NAMES
+
+
+def scan_negative_images(dataset_dir: Path) -> list[Sample]:
+    """负样本（OK 图）：负样本文件夹内无同名 .json 的图片 → 空标注样本。
+
+    遍历规则与 scan_labelme_dataset 一致（递归、跳过隐藏目录）；文件夹在
+    数据集内任一层级命名为 NEGATIVE_DIR_NAMES 之一即可。已有 json 的图
+    （含 shapes 为空的「已审无缺陷」标注）始终由 scan_labelme_dataset 收录。
+    """
+    dataset_dir = Path(dataset_dir)
+    samples: list[Sample] = []
+    for img in sorted(dataset_dir.rglob("*")):
+        if not img.is_file() or img.suffix.lower() not in IMAGE_EXTS:
+            continue
+        dirs = img.relative_to(dataset_dir).parts[:-1]
+        if any(part.startswith(".") for part in dirs):
+            continue
+        if not any(is_negative_dir_name(part) for part in dirs):
+            continue
+        if img.with_suffix(".json").exists():
+            continue
+        try:
+            width, height = image_size(img)
+        except Exception:  # noqa: BLE001  损坏图片不进训练
+            continue
+        samples.append(Sample(image_path=img, width=width, height=height, shapes=[]))
+    return samples
 
 
 def scan_classification_dataset(dataset_dir: Path) -> tuple[list[Sample], list[str]]:

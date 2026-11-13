@@ -16,7 +16,8 @@ from ..dataset.base import TaskType
 from ..dataset.converters import _clipped_bbox
 from ..io_utils import imread_unicode
 from ..metrics.detection import detection_confusion_matrix
-from .base import BaseModel, Prediction, TrainConfig, TrainReporter
+from ..metrics.per_class import ultralytics_per_class_ap50
+from .base import BaseModel, Prediction, TrainConfig, TrainReporter, negative_fp_stats
 from .modules import NWDCIoUBboxLoss
 from .yolo_data import _ValTrainerShim, make_yolo_trainer
 from ..offline import WEIGHTS_DIR
@@ -66,7 +67,7 @@ def _masks_to_original(res, orig_hw) -> list:
             for i in range(crop.shape[0])]
 
 
-def _lean_yolo_ckpt(ckpt: dict) -> dict:
+def _lean_yolo_ckpt(ckpt: dict, color_mode: str = "") -> dict:
     """剥离 ultralytics ckpt 中推理无关的数据（optimizer/scaler/训练指标等）。
 
     原生 best.pt 体积约为网络本身的 2~3 倍。注意两点：
@@ -75,6 +76,8 @@ def _lean_yolo_ckpt(ckpt: dict) -> dict:
       load_checkpoint 才能取到；
     - 白名单保留加载必需键（epoch/best_fitness/train_args/date/version），
       其余一律不落盘。
+    color_mode（O5，V0.7）：灰度训练标记随权重走（ultralytics 读取时忽略
+    未知键；平台 load_weights 读回决定推理侧是否同口径转灰）。
     """
     lean = {}
     for k in ("epoch", "best_fitness", "train_args", "date", "version"):
@@ -86,7 +89,52 @@ def _lean_yolo_ckpt(ckpt: dict) -> dict:
     lean["model"] = model
     if model is None:
         raise RuntimeError("权重文件中未找到可用模型（model/ema 均为空）")
+    if color_mode:
+        lean["color_mode"] = color_mode
     return lean
+
+
+# P2 小目标头模板目录：以 yolo11n-p2.yaml 等名称请求，ultralytics 自动映射到
+# 同目录的 yolo11-p2.yaml / yolo11-seg-p2.yaml 并按名称中的尺码字母取 scale
+P2_CFG_DIR = Path(__file__).with_name("configs")
+
+
+def _shift_head_levels(net, src_net) -> int:
+    """P2 模型继承源模型检测/分割头：按**步长**对齐分支（源 stride s 的分支
+    → 目标 stride s 的分支）；目标新增的步长（stride 4）用源最细分支
+    （stride 8）初始化——两分支结构与通道相同，随机初始化的新分支在小数据
+    集上收敛极慢（12 轮对照 bbox mAP@50 0.20 vs 0.48）。
+
+    不能按下标固定平移：分割模板的输入顺序是 [P3, P2, P4, P5]（proto 必须
+    取 P3），检测模板是 [P2, P3, P4, P5]——固定 i→i+1 会把 P3 预训练写进
+    P2 分支、P3 分支反而随机。原型网络（proto）与 DFL 同名迁移。返回迁移
+    的张量数。
+    """
+    src = src_net.float().state_dict()
+    dst = net.state_dict()
+    i_src, i_dst = str(len(src_net.model) - 1), str(len(net.model) - 1)
+    s_src = [int(round(float(s))) for s in src_net.model[-1].stride]
+    s_dst = [int(round(float(s))) for s in net.model[-1].stride]
+    targets = {i: [s_dst.index(s)] for i, s in enumerate(s_src) if s in s_dst}
+    finest = min(range(len(s_src)), key=lambda i: s_src[i])
+    targets.setdefault(finest, []).extend(
+        j for j, s in enumerate(s_dst) if s not in s_src)
+    moved = {}
+    for k, v in src.items():
+        parts = k.split(".")
+        if len(parts) < 3 or parts[1] != i_src:
+            continue
+        tail = parts[2:]
+        if tail[0] in ("cv2", "cv3", "cv4") and len(tail) > 1 and tail[1].isdigit():
+            keys = [".".join(["model", i_dst, tail[0], str(j)] + tail[2:])
+                    for j in targets.get(int(tail[1]), ())]
+        else:
+            keys = [".".join(["model", i_dst] + tail)]
+        for nk in keys:
+            if nk in dst and dst[nk].shape == v.shape:
+                moved[nk] = v
+    net.load_state_dict(moved, strict=False)
+    return len(moved)
 
 
 class YoloModel(BaseModel):
@@ -99,8 +147,13 @@ class YoloModel(BaseModel):
         super().__init__(num_classes, device)
         self.size = size
         self.task = TaskType(task)
-        base = size if self.task is TaskType.DETECTION else f"{size}-seg"
-        if use_pretrained:
+        self.p2 = size.endswith("-p2")  # P2 小目标头变体（stride 4 第四检测层）
+        base_name = size[:-3] if self.p2 else size
+        base = base_name if self.task is TaskType.DETECTION else f"{base_name}-seg"
+        self.p2_source = base           # P2 预训练迁移源（yolo11n / yolo11n-seg…）
+        if self.p2:
+            self.init_weight = str(P2_CFG_DIR / f"{base}-p2.yaml")
+        elif use_pretrained:
             bundled = WEIGHTS_DIR / "ultralytics" / f"{base}.pt"
             # 优先用随包官方预训练权重，保证离线可训练
             self.init_weight = str(bundled) if bundled.is_file() else f"{base}.pt"
@@ -108,11 +161,23 @@ class YoloModel(BaseModel):
             self.init_weight = f"{base}.yaml"
         self.model: YOLO | None = None
 
+    def enable_p2(self) -> None:
+        """训练参数「P2 小目标检测头」：把所选 YOLO 模型切换为同尺寸 P2 变体
+        （fit 前调用；已是 P2 时为空操作）。产物权重自带结构，加载不依赖本开关。"""
+        if self.p2:
+            return
+        self.p2 = True
+        base = self.size if self.task is TaskType.DETECTION else f"{self.size}-seg"
+        self.p2_source = base
+        self.init_weight = str(P2_CFG_DIR / f"{base}-p2.yaml")
+
     # ---- 训练 ----
     def fit(self, data, cfg: TrainConfig, reporter: TrainReporter) -> dict:
         # 恢复训练（剪枝模型）时直接用已加载的 YOLO 对象，否则从预训练权重起步
         resume = getattr(self, "resume_weights", False)
         model = self.model if resume else YOLO(self.init_weight)
+        if self.p2 and not resume and cfg.use_pretrained:
+            self._p2_transfer(model)
         self._reporter = reporter
         self._history: list[dict] = []
         self._loss_patch = "off"
@@ -158,6 +223,8 @@ class YoloModel(BaseModel):
         trainer_cls._xccv_classes = data.classes
         trainer_cls._xccv_ops = data.augment_ops
         trainer_cls._xccv_probs = data.augment_probs
+        self.color_mode = getattr(cfg, "color_mode", "color")  # O5：评估/推理同口径
+        trainer_cls._xccv_gray = self.color_mode == "gray"
         if resume:
             trainer_cls.resume_module = model.model  # 剪后网络直接参与训练
 
@@ -194,7 +261,8 @@ class YoloModel(BaseModel):
         # 只保留 model/train_args 等加载必需键
         ckpt = torch.load(best, map_location="cpu", weights_only=False)
         plaintext = cfg.output_dir / "best.pt"
-        torch.save(_lean_yolo_ckpt(ckpt), plaintext)
+        torch.save(_lean_yolo_ckpt(ckpt, color_mode=getattr(cfg, "color_mode", "color")),
+                   plaintext)
         # 加载最优权重进内存，再清理 ultralytics 训练目录里的中间权重
         self.model = YOLO(str(best))
         self.model.model.to(self.device)
@@ -204,6 +272,8 @@ class YoloModel(BaseModel):
         # 最终指标：用最优权重在内存验证集上评估（复用训练期 validator）
         final = self._final_metrics(model.trainer)
         final.update(self._loose_metrics(data))
+        final.update(negative_fp_stats(
+            lambda im: self.predict(im, conf=0.25), data.val_samples))
         log.info("YOLO 训练完成: bbox mAP@50=%.4f mAP@50-95=%.4f 掩码 mAP@50=%s",
                  final["map50"], final["map50_95"], final.get("mask_map50", "-"))
         return {
@@ -214,6 +284,7 @@ class YoloModel(BaseModel):
             "trainable_params": getattr(self, "_trainable", 0),
             "loss_patch": self._loss_patch,
             "early_stopped": getattr(getattr(self.model, "trainer", None), "early_stop", False),
+            "neg_train_images": int(getattr(data, "neg_train_count", 0)),
             "history": self._history,
             "confusion_matrix": self._confusion_matrix(data),
             "classes": data.classes,
@@ -246,7 +317,30 @@ class YoloModel(BaseModel):
             # mask 口径仅作内部参数记录，不进曲线/摘要展示
             out.update(mask_map50=round(float(m.seg.map50), 4),
                        mask_map50_95=round(float(m.seg.map), 4))
+        # O1（V0.7）：逐类 AP@50（仅验证集中出现过的类有值，缺类记 0.0）
+        per_ap = ultralytics_per_class_ap50(ns)
+        if per_ap:
+            out["per_class_ap50"] = per_ap
         return out
+
+    def _p2_transfer(self, model) -> None:
+        """P2 头无官方预训练：同尺寸官方权重同名迁移（骨干 + 颈部）+ 检测头
+        按步长对齐迁移（_shift_head_levels），仅新增的 stride 4 分支从头学。
+
+        必须经 model.load()：它同时置 ckpt，ultralytics Model.train 只在 ckpt
+        非空时把内存权重交给训练器，否则按 yaml 重建随机网络。
+        """
+        bundled = WEIGHTS_DIR / "ultralytics" / f"{self.p2_source}.pt"
+        src_path = str(bundled) if bundled.is_file() else f"{self.p2_source}.pt"
+        try:
+            model.load(src_path)
+            ck = model.ckpt or {}
+            src = ck.get("ema") if ck.get("ema") is not None else ck.get("model")
+            moved = _shift_head_levels(model.model, src) if src is not None else 0
+            log.info("P2 预训练迁移: %s → %s-p2（骨干/颈部同名迁移 + 检测头按步长对齐 %d 张量）",
+                     self.p2_source, self.p2_source, moved)
+        except Exception as e:  # noqa: BLE001  迁移失败不阻塞：随机初始化继续训练
+            log.warning("P2 预训练迁移失败（按随机初始化继续训练）: %s", e)
 
     def _loose_metrics(self, data, predict_fn=None) -> dict:
         """宽松口径（IoU {0.10,0.25,0.50} 三档平均）bbox mAP/mAR——与
@@ -341,24 +435,34 @@ class YoloModel(BaseModel):
         self._det_seen = 0
 
     def _on_val_start(self, trainer):
-        """训练开始：包装 validator.update_metrics 收集 NMS 后检出。"""
+        """训练开始：包装 validator.update_metrics 收集 NMS 后检出。
+
+        只取 NMS 后的 bboxes/conf/cls 自行还原到原图（与官方 scale_preds
+        同一 scale_boxes 口径），不调验证器的 _prepare_pred/_prepare_batch：
+        分割验证器在这两处做掩码处理，无 GT 且无检出的图（OK 负样本）会
+        触发空张量索引，整批检出丢失。逐图隔离，一张失败不连累同批。
+        """
         try:
             v = getattr(trainer, "validator", None)
             if v is None or getattr(v, "_xccv_wired", False):
                 return
+            from ultralytics.utils import ops as _ops
 
             def wrapped(preds, batch, *a, **k):
-                try:
-                    for si, pred in enumerate(preds):
-                        predn = v._prepare_pred(pred)
-                        pbatch = v._prepare_batch(si, batch)
-                        scaled = v.scale_preds(predn, pbatch)
-                        bb = scaled["bboxes"].detach().float().cpu().numpy()
-                        cf = scaled["conf"].detach().float().cpu().numpy()
-                        cl = scaled["cls"].detach().float().cpu().numpy()
-                        im = str(pbatch.get("im_file", ""))
-                        gi = self._val_index.get(
-                            im, self._det_seen + si)
+                imgsz = batch["img"].shape[2:]
+                for si, pred in enumerate(preds):
+                    try:
+                        bb = pred.get("bboxes") if isinstance(pred, dict) else None
+                        if bb is None or bb.shape[0] == 0:
+                            continue
+                        scaled = _ops.scale_boxes(
+                            imgsz, bb.detach().clone().float(),
+                            batch["ori_shape"][si], ratio_pad=batch["ratio_pad"][si])
+                        bb = scaled.cpu().numpy()
+                        cf = pred["conf"].detach().float().cpu().numpy()
+                        cl = pred["cls"].detach().float().cpu().numpy()
+                        im = str(batch["im_file"][si])
+                        gi = self._val_index.get(im, self._det_seen + si)
                         for (x1, y1, x2, y2), conf, c in zip(bb, cf, cl):
                             self._epoch_dets.append({
                                 "image_id": int(gi),
@@ -366,9 +470,9 @@ class YoloModel(BaseModel):
                                 "bbox": [float(x1), float(y1),
                                          float(x2 - x1), float(y2 - y1)],
                                 "score": float(conf)})
-                    self._det_seen += len(preds)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("验证检出收集失败: %s", e)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("验证检出收集失败（第 %d 张，已跳过）: %s", si, e)
+                self._det_seen += len(preds)
                 return orig(preds, batch, *a, **k)
 
             orig = v.update_metrics
@@ -584,6 +688,10 @@ class YoloModel(BaseModel):
     def predict(self, image_bgr: np.ndarray, conf: float = 0.25, iou: float = 0.45) -> Prediction:
         if self.model is None:
             raise RuntimeError("模型尚未训练或加载权重")
+        # O5（V0.7）：灰度训练的模型推理前同样转灰（训练/推理同处理方式）
+        if getattr(self, "color_mode", "color") == "gray":
+            gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+            image_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         res = self.model.predict(image_bgr, conf=conf, iou=iou,
                                  device=self.device, verbose=False)[0]
         boxes = res.boxes.xyxy.cpu().numpy().tolist() if res.boxes is not None else []
@@ -599,6 +707,12 @@ class YoloModel(BaseModel):
         """加载 ultralytics 训练产出的 .pt。"""
         self.model = YOLO(str(path))
         self.model.model.to(self.device)
+        # O5（V0.7）：读回灰度训练标记（lean ckpt 顶层键，ultralytics 忽略）
+        try:
+            ck = torch.load(path, map_location="cpu", weights_only=False)
+            self.color_mode = str((ck or {}).get("color_mode") or "color")
+        except Exception:
+            self.color_mode = "color"
         names = self.model.names
         self.num_classes = len(names)
         self.classes = list(names.values())

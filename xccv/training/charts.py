@@ -108,6 +108,60 @@ class DistributionCanvas(_WheelThroughCanvas):
         self.draw()
 
 
+class SplitDonutCanvas(_WheelThroughCanvas):
+    """O12（V0.7）：训练/验证划分环形图（已标训练/验证 + OK 训练/验证）。"""
+
+    _COLORS = (ACCENT, "#f58518", "#54a24b", "#b279a2")
+
+    def __init__(self, parent=None):
+        self.fig = Figure(figsize=(4.6, 3.4), constrained_layout=True)
+        self.fig.patch.set_facecolor(BG)
+        super().__init__(self.fig)
+        if parent is not None:
+            self.setParent(parent)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumHeight(230)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_facecolor(PANEL)
+        self.ax.text(0.5, 0.5, "暂无数据", ha="center", va="center",
+                     color=MUTED, fontsize=11)
+        self.ax.set_axis_off()
+
+    def update_split(self, n_labeled: int, n_ok: int, val_ratio: float) -> None:
+        """按比例近似展示划分（划分种子细节以体检/日志为准，本图为示意）。"""
+        self.ax.clear()
+        self.ax.set_facecolor(PANEL)
+        val_ratio = min(max(float(val_ratio), 0.0), 0.9)
+        segs = []
+        if n_labeled:
+            segs.append((f"已标训练 {round(n_labeled * (1 - val_ratio))}",
+                         n_labeled * (1 - val_ratio)))
+            segs.append((f"已标验证 {round(n_labeled * val_ratio)}",
+                         n_labeled * val_ratio))
+        if n_ok:
+            segs.append((f"OK 训练 {round(n_ok * (1 - val_ratio))}",
+                         n_ok * (1 - val_ratio)))
+            segs.append((f"OK 验证 {round(n_ok * val_ratio)}",
+                         n_ok * val_ratio))
+        if not segs or sum(v for _, v in segs) <= 0:
+            self.ax.text(0.5, 0.5, "暂无数据", ha="center", va="center",
+                         color=MUTED, fontsize=11)
+            self.ax.set_axis_off()
+            self.draw()
+            return
+        names = [s[0] for s in segs]
+        values = [max(s[1], 1e-9) for s in segs]
+        wedges, _ = self.ax.pie(values, colors=self._COLORS[:len(values)],
+                                startangle=90,
+                                wedgeprops=dict(width=0.42, edgecolor=BG))
+        self.ax.set_title("训练 / 验证划分", fontsize=13, color=FG)
+        self.ax.legend(wedges, names, loc="center left",
+                       bbox_to_anchor=(1.0, 0.5), fontsize=9,
+                       frameon=False, labelcolor=FG)
+        self.ax.set_aspect("equal")
+        self.draw()
+
+
 class ConfusionMatrixCanvas(_WheelThroughCanvas):
     """混淆矩阵热力图（含背景行列，用于检测/分割的漏检误检）。"""
 

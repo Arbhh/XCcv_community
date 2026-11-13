@@ -8,6 +8,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 from .dataset_stats import collect_stats
 from .project import Project
+from ..engine.dataset.base import TaskType
 
 log = logging.getLogger(__name__)
 
@@ -102,22 +103,34 @@ class TrainThread(QThread):
                 raise ValueError("数据集中未发现类别，请先完成标注或检查数据集路径")
             resume_path = self._resume_model_path()
             if resume_path is not None:
-                # 项目自有的已有权重（迁移学习或训练记录产物）：直接作为起始模型
+                # 项目自有的已有权重（剪枝模型或训练记录产物）：直接作为起始模型
                 from ..engine.models import load_model
 
                 model = load_model(resume_path, device=project.device)
                 model.resume_weights = True
-                if list(model.classes or []) != list(stats.classes):
+                # A1/A2（V0.7）：异常检测/OCR 模型的 classes 恒为内置占位，
+                # 不做数据集类别一致性校验（记忆库/字符集与类别无关）
+                if task not in (TaskType.ANOMALY, TaskType.OCR) and \
+                        list(model.classes or []) != list(stats.classes):
                     raise ValueError(
                         f"所选模型的类别（{model.classes or []}）与当前数据集"
                         f"（{stats.classes}）不一致，无法直接继续训练；"
-                        "请检查迁移学习权重文件与数据集类别设置")
+                        "请在模型工具中重新生成剪枝模型，或检查数据集类别设置")
                 log.info("从已有模型权重恢复训练: %s", resume_path)
             else:
                 model = create_model(
                     project.model_name, task, len(stats.classes),
                     device=project.device, use_pretrained=project.use_pretrained,
                 )
+                if getattr(project, "p2_head", False):
+                    # P2 小目标检测头仅 YOLO 家族有效，其他家族无该能力即忽略
+                    enable_p2 = getattr(model, "enable_p2", None)
+                    if enable_p2 is not None:
+                        enable_p2()
+                        log.info("已启用 P2 小目标检测头: %s", project.model_name)
+                    else:
+                        log.info("P2 小目标检测头仅对 YOLO 家族生效，%s 忽略该选项",
+                                 project.model_name)
             resize = (project.augment_ops or {}).get("resize") or {}
             resize_w, resize_h = int(resize.get("width", 0) or 0), int(resize.get("height", 0) or 0)
             cfg = TrainConfig(
@@ -135,6 +148,8 @@ class TrainThread(QThread):
                 multiply_factor=project.multiply_factor,
                 augment_ops=dict(project.augment_ops),
                 augment_probs=dict(getattr(project, "augment_probs", None) or {}),
+                color_mode=getattr(project, "color_mode", "color"),
+                deterministic=bool(getattr(project, "deterministic", False)),
                 # 训练输入尺寸与增强 resize 统一（归一化）；未启用 resize 时走模型默认
                 image_width=resize_w,
                 image_height=resize_h,
@@ -156,6 +171,9 @@ class TrainThread(QThread):
                 train_input=getattr(project, "train_input", 0),
                 tiling=bool(getattr(project, "tiling", False)),
                 tile_size=int(getattr(project, "tile_size", 640) or 640),
+                use_negatives=bool(getattr(project, "use_negatives", True)),
+                p2_head=bool(getattr(project, "p2_head", False)
+                             and getattr(model, "p2", False)),
                 save_epoch_weights=getattr(project, "save_epoch_weights", True),
                 resume_from_pruned=resume_path is not None,
             )

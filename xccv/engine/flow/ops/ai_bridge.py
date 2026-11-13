@@ -63,7 +63,7 @@ class AiModelBase(VisionNode):
     """AI 模型节点基类（按任务拆分为三个节点，Q5：流程步骤对外暴露清晰）。
 
     模型加载走 engine.models.registry.load_model 唯一入口（D5），支持
-    .xva/.pt/.xcs；加载后校验任务类型与节点一致；模型按路径会话缓存
+    .pt；加载后校验任务类型与节点一致；模型按路径会话缓存
     （ctx 键 ai_model:<path>）；类别名表写入 ctx.model_classes。
     """
 
@@ -76,7 +76,7 @@ class AiModelBase(VisionNode):
                Port("result", "result", label="结果"))
     PARAMS = {
         "model_path": ParamSpec("model_path", "模型文件", "path", "",
-                                tooltip=".xva / .pt / .xcs 权重"),
+                                tooltip=".pt 权重"),
         "conf": ParamSpec("conf", "置信度", "float", 0.25, range=(0.0, 1.0)),
         "iou": ParamSpec("iou", "IOU", "float", 0.45, range=(0.0, 1.0)),
         "device": ParamSpec("device", "设备", "enum", "auto",
@@ -149,7 +149,7 @@ class RoiBatchClassify(VisionNode):
                Port("result", "result", label="结果"))
     PARAMS = {
         "model_path": ParamSpec("model_path", "分类模型", "path", "",
-                                tooltip="分类任务权重（.xva/.pt）"),
+                                tooltip="分类任务权重（.pt）"),
         "conf": ParamSpec("conf", "置信度", "float", 0.5, range=(0.0, 1.0),
                           tooltip="复判得分的展示口径，不二次过滤"),
         "margin": ParamSpec("margin", "边缘比", "float", 0.1, range=(0.0, 0.5),

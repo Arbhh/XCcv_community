@@ -21,7 +21,7 @@ diff -r labelme-5.8.1/labelme labelme/
 | 文件 | 规模 | 修改性质 |
 |---|---|---|
 | `__init__.py` | +17/-12 | `__appname__` 改为「XCcv 标注平台」；宿主初始化调整 |
-| `app.py` | +748/-178 | 接入 AI 智能标注（模型选择、参数对话框 `_ai_params` / `_fill_ai_models` 等）；类别归类归档 `_archive_to_class_dir`；文件列表右键菜单；灰度预览 `_apply_grayscale_if_enabled` 等宿主行为 |
+| `app.py` | +1029/-184（0.7 追加 +281/-6） | 接入 AI 智能标注（模型选择、参数对话框 `_ai_params` / `_fill_ai_models` 等）；类别归类归档 `_archive_to_class_dir`；文件列表右键菜单；灰度预览 `_apply_grayscale_if_enabled`；0.7 追加 O9 OK 徽标/设为 OK 目录、O10 标注质量要点/AI 复核漏标、AI 等待横幅 |
 | `config/__init__.py` | +2/-2 | 配置文件读取显式 `encoding="utf-8"`（Windows 中文路径兼容） |
 | `config/default_config.yaml` | +12/-9 | 默认开启自动保存与 AI 多边形/掩码/画笔（`auto_save: true` 等）；快捷键体系调整为 Q/W/E/I/S/B/T/V |
 | `label_file.py` | +199/-165 | 标注文件读写适配（默认 `store_data: false` 后的图像数据策略等） |
@@ -30,7 +30,7 @@ diff -r labelme-5.8.1/labelme labelme/
 | `utils/qt.py` | +103/-78 | Qt 控件构建工具适配（图标、快捷键格式化等） |
 | `widgets/ai_prompt_widget.py` | +170/-131 | AI 提示参数面板：新增置信度/IOU 阈值、NMS 参数、文本提示控件（`_ScoreThresholdWidget` / `_IouThresholdWidget` / `_NmsParamsWidget` / `_TextPromptWidget`） |
 | `widgets/brightness_contrast_dialog.py` | +86/-57 | 亮度/对比度对话框行为适配 |
-| `widgets/canvas.py` | +2136/-953 | 画布接入 AI 智能多边形与画笔标注（锚点交互 `_ai_add_anchor`、异步编解码 `_ai_decode_async` / `_ai_decode_worker`、结果提交 `_ai_commit_pending` 等 `_ai_*` 系列） |
+| `widgets/canvas.py` | +2142/-953（0.7 追加 +6） | 画布接入 AI 智能多边形与画笔标注（锚点交互 `_ai_add_anchor`、异步编解码 `_ai_decode_async` / `_ai_decode_worker`、结果提交 `_ai_commit_pending` 等 `_ai_*` 系列）；0.7 追加加载失败解锁与嵌入等待提示 |
 | `widgets/color_dialog.py` | +36/-27 | 颜色对话框适配 |
 | `widgets/file_dialog_preview.py` | +80/-58 | 文件对话框预览适配 |
 | `widgets/label_dialog.py` | +243/-215 | 类别对话框适配（类别体系管理等） |
@@ -47,6 +47,11 @@ diff -r labelme-5.8.1/labelme labelme/
 | 文件 | 说明 |
 |---|---|
 | `_automation/bbox_from_text.py` | 上游自动化脚本，未随社区版分发 |
+
+0.7.0 追加修改（2026-11-13）：
+
+- `app.py`：O9 OK/良品目录徽标与右键“设为 OK 目录”；O10 帮助菜单“标注质量要点”“AI 复核当前图（疑似漏标）”；AI 等待顶部横幅。
+- `widgets/canvas.py`：AI 模型加载失败时解除 `_ai_loading` 锁；首次点击嵌入未就绪时状态提示。
 
 ## 未修改的部分
 

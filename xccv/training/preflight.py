@@ -93,6 +93,20 @@ def param_findings(project, facts: DatasetFacts | None = None,
             field="patience", value=max(1, epochs // 3),
             apply_text=f"设为 {max(1, epochs // 3)} 轮"))
 
+    name = str(project.model_name or "")
+    if getattr(project, "p2_head", False):
+        if name.startswith("yolo"):
+            findings.append(Finding(
+                LEVEL_INFO, "p2_vram",
+                "已启用 P2 小目标检测头：新增 stride 4 检测层，显存占用约为普通"
+                "模型的 2 倍以上（实测 1920 输入下 yolo11n-seg + P2 batch4 约 "
+                "13 GiB）——显存不足时优先减小批量或输入尺寸；新增分支从零学，"
+                "建议适当增加训练轮次。"))
+        else:
+            findings.append(Finding(
+                LEVEL_INFO, "p2_not_yolo",
+                f"P2 小目标检测头仅对 YOLO 家族生效，当前模型 {name} 不受影响。"))
+
     rec_lr = _RECOMMEND_LR.get(project.model_name)
     if rec_lr and epochs > 0:
         lr = float(project.learning_rate)
@@ -177,6 +191,16 @@ def recommend_settings(project, facts: DatasetFacts | None,
                          "小样本工业场景建议开启工业优化（注意力 + 改进损失）"))
         recs.append(("augment_probs", 0.7,
                      "小样本场景建议把已启用增强算子的概率提高到 0.7 增加样本多样性"))
+    # O7（V0.7）：轮次智能推荐——**保守口径**：只在小数据且当前轮次明显
+    # 不足（<20）时升级到 60（早停耐心兜底）。不做"大档推荐"：预设
+    # （如 quality=300 轮）是用户的显式选择，推荐不与之打架
+    # （f7e 实锤：无条件 epochs 推荐会覆盖预设/污染保守断言）。
+    if task in ("detection", "segmentation") and 0 < max_count < 300 \
+            and 0 < int(getattr(project, "epochs", 0)) < 20:
+        recs.append(("epochs", 60,
+                     f"最大类别样本 {max_count}（<300）且当前仅 "
+                     f"{int(project.epochs)} 轮：建议 60 轮"
+                     "（小样本收敛慢，早停耐心兜底防过训）"))
     if task in ("detection", "segmentation") \
             and project.model_name in _RCNN_MODELS \
             and not getattr(project, "rpn_reduced", False):

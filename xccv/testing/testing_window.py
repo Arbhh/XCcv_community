@@ -27,8 +27,8 @@ from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
     QGraphicsScene, QGraphicsTextItem, QGraphicsView, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPushButton, QScrollArea, QShortcut, QSlider, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QShortcut, QSlider, QStackedWidget, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..engine.io_utils import imread_unicode
@@ -82,7 +82,7 @@ class _BatchThread(QThread):
     finished_ok = pyqtSignal(list)
     failed = pyqtSignal(str)
 
-    def __init__(self, model, paths, conf, iou, classes, task,
+    def __init__(self, model, paths, conf, iou, flow, classes, task,
                  out_dir: Path | None = None, save_json: bool = True,
                  save_images: bool = False, jpg_quality: int = 95,
                  root: Path | None = None, model_text: str = "", parent=None,
@@ -91,7 +91,7 @@ class _BatchThread(QThread):
         self._model = model
         self._paths = list(paths)
         self._conf, self._iou = conf, iou
-        self._classes = classes
+        self._flow, self._classes = flow, classes
         self._task = task
         self._out_dir = Path(out_dir) if out_dir else None
         self._save_json = save_json
@@ -116,6 +116,25 @@ class _BatchThread(QThread):
             total = len(self._paths)
             import time as _time
 
+            # O13（V0.7）：批量预热——首图推理一次不计入统计（暖 CUDA 上下文
+            # 与引擎缓存）。失败不阻塞批量本身。
+            if total:
+                try:
+                    wimg = imread_unicode(self._paths[0])
+                    if wimg is not None:
+                        if self._tiled and self._task != "classification":
+                            from ..engine.tiled_infer import tiled_predict
+
+                            tiled_predict(self._model, wimg, conf=self._conf,
+                                          iou=self._iou)
+                        else:
+                            self._model.predict(wimg, conf=self._conf,
+                                                iou=self._iou)
+                        log.info("批量预热完成（不计入耗时统计）: %s",
+                                 self._paths[0].name)
+                except Exception:  # noqa: BLE001
+                    log.warning("批量预热失败（忽略）", exc_info=True)
+
             for i, p in enumerate(self._paths, start=1):
                 _t0 = _time.perf_counter()
                 img = imread_unicode(p)
@@ -130,7 +149,17 @@ class _BatchThread(QThread):
                 else:
                     pred = self._model.predict(img, conf=self._conf,
                                                iou=self._iou)
+                if self._flow:
+                    from ..engine.flow.legacy_adapter import apply_flow_safe
+
+                    pred, _info = apply_flow_safe(
+                        pred, (w, h), self._flow, classes=self._classes or None)
                 detections = []
+                # O2 扩展（V0.7）：逐图灰度图（前景占比/灰度差维度的计算底图）
+                gray = None
+                if self._task in ("detection", "segmentation"):
+                    gray = img if img.ndim == 2 else cv2.cvtColor(
+                        img, cv2.COLOR_BGR2GRAY)
                 for j, box in enumerate(pred.boxes):
                     x1, y1, x2, y2 = (float(v) for v in box)
                     label = (self._classes[pred.labels[j]]
@@ -142,6 +171,11 @@ class _BatchThread(QThread):
                            "bbox_area": int(round((x2 - x1) * (y2 - y1)))}
                     if pred.masks is not None and j < len(pred.masks):
                         det["mask_area"] = int(pred.masks[j].sum())
+                    if gray is not None:
+                        # 阈值面板多维度（_dims 内部键，不进统一 JSON）
+                        from ..engine.flow.ops.det_filters import box_image_dims
+
+                        det["_dims"] = box_image_dims(gray, [x1, y1, x2, y2])
                     detections.append(det)
                 result = {"file": p.name, "path": str(p),
                           "width": w, "height": h,
@@ -166,6 +200,15 @@ class _BatchThread(QThread):
             from ..engine.result_json import batch_summary, save_result_json
 
             self.summary = batch_summary(results, self._costs_ms)
+            # O2/O19（V0.7）：GT 匹配统计——批量目录里同名 labelme json
+            # 视为真值；无 GT 时面板与复判对话框给出说明。
+            try:
+                from ..engine.metrics.batch_match import collect_match_stats
+
+                self.summary["match_stats"] = collect_match_stats(
+                    results, iou_thr=self._iou)
+            except Exception:  # noqa: BLE001  统计失败不影响批量结果
+                log.warning("批量 GT 匹配统计失败", exc_info=True)
             if self._save_json and self._out_dir is not None:
                 # P8/T8-2：统计摘要随批量产物落盘（属批量任务而非 UI 职责）
                 try:
@@ -198,7 +241,8 @@ class _BatchThread(QThread):
                 model={"file": self._model_text},
                 inference={"conf": self._conf, "iou": self._iou},
                 prediction=pred, classes=self._classes or [],
-                flow_info=None)
+                flow_info={"removed": 0, "count_check": None}
+                if self._flow else None)
             out = self._rel_target(path, "检出结果", ".json")
             if self._json_format == "labelme":
                 from ..engine.result_json import to_labelme
@@ -239,7 +283,7 @@ class _BatchThread(QThread):
             rendered = draw_predictions(
                 img, pred, self._classes or [], self._task,
                 show_labels=True,
-                show_masks=(self._task == "segmentation"))
+                show_masks=(self._task in ("segmentation", "anomaly")))
             out = self._rel_target(path, "可视化", ".jpg")
             cv2.imwrite(str(out), rendered,
                         [int(cv2.IMWRITE_JPEG_QUALITY), self._jpg_quality])
@@ -308,7 +352,15 @@ class TestingWindow(QMainWindow):
 
         self.model = None            # 引擎 BaseModel 实例
         self.classes: list[str] = []
-        self.task: str = ""          # classification / detection / segmentation
+        self._flow = None            # 检出过滤流程（项目文件夹中的 检出流程.json）
+        self._flow_info = None
+        self._flow_base = None       # O2：阈值应用落点
+        self._loaded_weights_path = None
+        self._last_batch_results = None
+        self._last_match_stats = None
+        self._batch_out_dir = None
+        self._review_ctx = None
+        self.task: str = ""          # classification / detection / segmentation / anomaly / ocr
         self.image_paths: list[Path] = []
         self._last_image = None      # 缓存最近一次推理的原图与结果，供显示开关/筛选切换
         self._last_prediction = None
@@ -319,6 +371,18 @@ class TestingWindow(QMainWindow):
         from ..status_bus import attach_platform_status
 
         attach_platform_status(self, "测试平台", "testing")
+        # 勘误：底部状态栏徽章旁加 标准 / 项目复盘 页签
+        self.btn_mode_std = QPushButton("标准")
+        self.btn_mode_std.setObjectName("seg")
+        self.btn_mode_std.setCheckable(True)
+        self.btn_mode_std.setChecked(True)
+        self.btn_mode_std.clicked.connect(lambda: self._switch_mode(0))
+        self.btn_mode_review = QPushButton("项目复盘")
+        self.btn_mode_review.setObjectName("seg")
+        self.btn_mode_review.setCheckable(True)
+        self.btn_mode_review.clicked.connect(lambda: self._switch_mode(1))
+        self.statusBar().addWidget(self.btn_mode_std)
+        self.statusBar().addWidget(self.btn_mode_review)
         self._refresh_projects()
         self._add_shortcuts()
 
@@ -331,7 +395,25 @@ class TestingWindow(QMainWindow):
     def closeEvent(self, event):
         if self._load_thread is not None and self._load_thread.isRunning():
             self._load_thread.wait(5000)  # 等待模型加载线程收尾，避免退出崩溃
+        # 勘误：复盘页临时缓存随平台关闭清理
+        self.review_page.shutdown()
         event.accept()
+
+    def _on_review_context(self, ctx: dict):
+        """复盘批量完成：把上下文接到宿主共享属性——复判/AB/应用阈值/
+        生成流程图四个处理器即可复用（权重/流程落点与标准批量一致）。"""
+        self._last_batch_results = ctx["results"]
+        self._last_match_stats = ctx["stats"]
+        self._loaded_weights_path = ctx["weights"]
+        self._flow_base = ctx["project_dir"]
+        self._batch_out_dir = Path(ctx["out_dir"])
+        self._review_ctx = ctx
+        try:   # 复判/AB 复推使用与复盘批量相同的检出流程
+            from ..engine.detection_flow import load_flow
+
+            self._flow = load_flow(Path(ctx["project_dir"]) / "检出流程.json")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _add_shortcuts(self):
         """XCcv：快捷键（A/D 切换图片、F 适应窗口、Ctrl+1 原始尺寸、Ctrl+O 打开）。"""
@@ -383,14 +465,41 @@ class TestingWindow(QMainWindow):
         head.addWidget(self.header_model_info)
         root.addWidget(header)
 
-        body = QHBoxLayout()
+        # 勘误（2026-11-13）：标准 / 项目复盘 双页（页签在底部状态栏）
+        self._detail_stack = QStackedWidget()
+        self._detail_stack.addWidget(self._build_standard_page())   # 0 标准
+        from .review_page import ProjectReviewPage
+
+        self.review_page = ProjectReviewPage()
+        self.review_page.openReviewRequested.connect(self._open_batch_review)
+        self.review_page.openCompareRequested.connect(self._open_model_compare)
+        self.review_page.applyConfRequested.connect(self._apply_conf_to_flow)
+        self.review_page.generateFlowRequested.connect(
+            self._generate_threshold_flow)
+        self.review_page.statusMessage.connect(
+            lambda t: self.statusBar().showMessage(t, 10000))
+        self.review_page.contextReady.connect(self._on_review_context)
+        self._detail_stack.addWidget(self.review_page)              # 1 复盘
+        # 上次会话残留的复盘缓存（关闭路径未走 closeEvent 时兜底清理）
+        self.review_page.clear_stale_cache()
+        root.addWidget(self._detail_stack, stretch=1)
+        self.setCentralWidget(central)
+
+    def _build_standard_page(self) -> QWidget:
+        page = QWidget()
+        body = QHBoxLayout(page)
         body.setContentsMargins(12, 12, 12, 12)
         body.setSpacing(12)
         body.addWidget(self._build_left_panel())
         body.addWidget(self._build_center(), stretch=1)
         body.addWidget(self._build_right_panel())
-        root.addLayout(body)
-        self.setCentralWidget(central)
+        return page
+
+    def _switch_mode(self, index: int):
+        """底部 标准 / 项目复盘 页签切换（互斥）。"""
+        self._detail_stack.setCurrentIndex(index)
+        self.btn_mode_std.setChecked(index == 0)
+        self.btn_mode_review.setChecked(index == 1)
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
@@ -600,22 +709,29 @@ class TestingWindow(QMainWindow):
         QApplication.restoreOverrideCursor()
         self.model = model
         self.classes = model.classes or []
+        self._loaded_weights_path = path  # O2/O20：阈值落点与回流目标解析
         task = getattr(model, "task", None)
         self.task = task.value if task is not None else ""
-        log.info("模型已加载: %s 任务=%s 类别数=%s 设备=%s",
-                 path.name, self.task, len(self.classes), model.device)
+        self._flow = self._load_flow_for(path)
+        self._warn_flow_mismatch()
+        log.info("模型已加载: %s 任务=%s 类别数=%s 设备=%s 检出流程=%s",
+                 path.name, self.task, len(self.classes), model.device,
+                 "有" if self._flow else "无")
+        # O14（V0.7）：推理形态显性化（社区版为 FP32 明文 .pt）
+        form_txt = "FP32 权重（.pt）"
         self.model_info.setText(
             f"权重：{path.name}\n任务：{task.label if task is not None else '未知'}\n"
-            f"类别数：{len(self.classes)}\n设备：{model.device}"
+            f"类别数：{len(self.classes)}\n设备：{model.device}\n推理形态：{form_txt}"
         )
         self.header_model_info.setText(
             f"{path.name}　|　{task.label if task is not None else '未知'}　|　{len(self.classes)} 类"
         )
         is_cls = self.task == "classification"
         is_seg = self.task == "segmentation"
+        is_anomaly = self.task == "anomaly"
         self.conf_slider.setEnabled(not is_cls)
         self.iou_slider.setEnabled(not is_cls)
-        self.show_masks.setVisible(is_seg)
+        self.show_masks.setVisible(is_seg or is_anomaly)
         self.show_area.setVisible(not is_cls)
         # 类别筛选下拉
         self.class_filter.blockSignals(True)
@@ -628,6 +744,32 @@ class TestingWindow(QMainWindow):
         self.result_stats.setText("模型已加载，请选择图片")
         self.result_list.clear()
 
+    def _load_flow_for(self, weights_path: Path):
+        """探测权重所属项目的检出过滤流程（项目文件夹中的 检出流程.json）。"""
+        from ..engine import detection_flow as df
+
+        for base in (weights_path.parent.parent, weights_path.parent):
+            flow = df.load_flow(base / "检出流程.json")
+            if flow:
+                self._flow_base = base  # O2：阈值应用落点
+                return flow
+        # 无流程文件：项目目录仍作为阈值应用的默认落点
+        self._flow_base = weights_path.parent.parent
+        return None
+
+    def _warn_flow_mismatch(self):
+        """检出流程引用的类别与当前模型类别不一致时，状态栏提示。"""
+        if not self._flow:
+            return
+        from ..engine import detection_flow as df
+
+        missing = df.flow_class_mismatch(self._flow, self.classes or [])
+        if missing:
+            self.statusBar().showMessage(
+                f"⚠ 检出流程引用的类别 {'、'.join(missing)} 不在当前模型类别中，"
+                "相关类别过滤不会命中，请核对流程设置", 15000)
+            log.warning("检出流程类别与模型不一致: %s（模型类别 %s）",
+                        missing, self.classes)
 
     def _on_model_load_failed(self, message: str):
         self._load_thread = None
@@ -730,7 +872,7 @@ class TestingWindow(QMainWindow):
         self._batch_out_dir = out_dir
         self.result_stats.setText(f"批量推理 0 / {len(files)} …")
         self._batch_thread = _BatchThread(
-            self.model, files, conf, iou, self.classes or [],
+            self.model, files, conf, iou, self._flow, self.classes or [],
             self.task, out_dir=out_dir, save_json=settings.save_json,
             save_images=settings.save_images,
             jpg_quality=settings.jpg_quality, root=folder,
@@ -767,8 +909,28 @@ class TestingWindow(QMainWindow):
                     for k, v in tops))
             lat = summary.get("latency_ms")
             if lat:
-                lines.append(f"单图耗时 p50={lat['p50_ms']:.0f} ms / "
-                             f"max={lat['max_ms']:.0f} ms")
+                # O13（V0.7）：min/avg 补齐 + 预热口径说明
+                lines.append(
+                    f"单图耗时 min={lat['min_ms']:.0f} / p50={lat['p50_ms']:.0f}"
+                    f" / avg={lat['avg_ms']:.0f} / max={lat['max_ms']:.0f} ms"
+                    "（首张已自动预热，不计入统计）")
+            # O15（V0.7）：耗时离散度告警（单图 > 中位数×3 疑似掉频/热节流）
+            outliers = summary.get("slow_outliers") or {}
+            if outliers.get("count"):
+                lines.append(
+                    f"⚠ 疑似 GPU 掉频/热节流：{outliers['count']} 张单图耗时"
+                    f" > 中位数（{outliers['median_ms']:.0f} ms）×3——"
+                    "查电源/驱动设置")
+            # O13（V0.7）：显存水位（GPU 环境才显示）
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    free_b, total_b = torch.cuda.mem_get_info()
+                    lines.append(
+                        f"显存占用：{(total_b - free_b) / 1048576:.0f} MB"
+                        f" / 共 {total_b / 1048576:.0f} MB")
+            except Exception:  # noqa: BLE001  无 CUDA/驱动异常不显示
+                pass
             # 摘要 .json 已由批量线程落盘（检出结果/摘要.json）
         if settings is not None and settings.save_json and out_dir is not None:
             lines.append(f"检出 JSON（每图一个，同名对应）：{out_dir / '检出结果'}")
@@ -776,11 +938,163 @@ class TestingWindow(QMainWindow):
             lines.append(f"渲染图：{out_dir / '可视化'}")
         self.result_stats.setText("\n".join(lines))
         self.statusBar().showMessage(f"批量运行完成，输出目录：{out_dir}", 10000)
+        # 标准页不再挂分数面板/复判入口——批量统计仅落盘，复盘走「项目复盘」页
+        self._last_match_stats = summary.get("match_stats") if summary else None
+        self._last_batch_results = results
         from ..ui_widgets import toast
 
         toast(self,
               f"批量推理完成：{len(results)} 张图，共检出 {total_det} 个目标",
               "success")
+
+    # ================= O2/O19/O20（V0.7）：批量评估闭环 =================
+    def _generate_threshold_flow(self, dims: dict):
+        """O2 扩展：面板启用维度阈值 → 生成流程图模板。"""
+        w = getattr(self, "_loaded_weights_path", None)
+        if not w:
+            QMessageBox.information(
+                self, "生成流程图模板",
+                "当前模型未关联权重文件（无法定位模型存放文件夹）；"
+                "请通过「加载模型」选择权重后再生成")
+            return
+        weights = Path(w)
+        model_dir = weights.parent.parent
+        model_name = weights.stem
+        from ..engine.flow.threshold_flow import save_threshold_flow
+
+        try:
+            path = save_threshold_flow(model_dir, model_name, dims,
+                                       str(weights),
+                                       task=str(self.task or "detection"))
+        except OSError as e:
+            QMessageBox.warning(self, "生成流程图模板", f"写入流程文件失败：{e}")
+            return
+        dims_text = "、".join(f"{k}={v:g}" for k, v in sorted(dims.items()))
+        self.statusBar().showMessage(
+            f"流程图模板已生成：{path}（启用维度：{dims_text}）", 15000)
+        from ..ui_widgets import toast
+
+        toast(self, "流程图模板已生成，可在流程图平台打开使用", "success")
+
+    def _apply_conf_to_flow(self, conf: float):
+        """面板阈值 → 项目「检出流程.json」置信度节点（O2 应用 + O18 留痕）。"""
+        base = getattr(self, "_flow_base", None)
+        if base is None:
+            w = getattr(self, "_loaded_weights_path", None)
+            if w is not None:
+                base = Path(w).parent.parent
+        if base is None:
+            QMessageBox.information(
+                self, "应用阈值",
+                "当前模型未关联训练项目（无法定位检出流程文件）；"
+                "请通过「加载该项目最新模型」或权重所在项目再应用")
+            return
+        from ..engine import detection_flow as df
+
+        flow_path = Path(base) / "检出流程.json"
+        flow = df.load_flow(flow_path) or df.new_flow()
+        node = next((n for n in flow.get("nodes", [])
+                     if n.get("op") == "confidence"), None)
+        if node is None:
+            node = {"op": "confidence", "params": {}}
+            flow.setdefault("nodes", []).insert(0, node)
+        stats = getattr(self, "_last_match_stats", None) or {}
+        node.setdefault("params", {})
+        node["params"]["min"] = round(float(conf), 2)
+        # O18 留痕：normalize_flow 保留节点的额外参数键（apply_flow 不读）
+        node["params"]["note"] = (
+            f"{time.strftime('%Y-%m-%d %H:%M')} 测试平台阈值面板：基于批量 "
+            f"{stats.get('n_gt_images', 0)} 张有标注图"
+            f"（GT {stats.get('gt_total', 0)} 实例）")
+        try:
+            df.save_flow(flow_path, flow)
+        except OSError as e:
+            QMessageBox.warning(self, "应用阈值", f"写入检出流程失败：{e}")
+            return
+        self._flow = flow  # 当前会话立即生效
+        self.statusBar().showMessage(
+            f"默认检出阈值已应用：conf={conf:.2f} → {flow_path}", 10000)
+        from ..ui_widgets import toast
+
+        toast(self, f"已应用为项目默认检出 conf={conf:.2f}", "success")
+
+    def _resolve_dataset_dir(self):
+        """权重所属项目的数据集目录（回流默认目标；找不到返回 None）。"""
+        w = getattr(self, "_loaded_weights_path", None)
+        if w is None:
+            return None
+        import json as _json
+
+        model_dir = Path(w).parent.parent  # run 目录的上级 = 模型储存目录
+        try:
+            pj = model_dir / "project.json"
+            if pj.is_file():
+                data = _json.loads(pj.read_text(encoding="utf-8"))
+                d = data.get("dataset_dir")
+                if d and Path(d).is_dir():
+                    return d
+            from ..training.project import list_projects, load_project
+
+            for name in list_projects():
+                try:
+                    p = load_project(name)
+                except Exception:
+                    continue
+                if Path(p.model_dir).resolve() == model_dir.resolve():
+                    return (p.dataset_dir
+                            if Path(p.dataset_dir).is_dir() else None)
+        except Exception:
+            pass
+        return None
+
+    def _open_batch_review(self):
+        results = getattr(self, "_last_batch_results", None)
+        if not results:
+            QMessageBox.information(self, "复判", "请先完成一次批量推理")
+            return
+        out_dir = getattr(self, "_batch_out_dir", None)
+        review_path = (Path(out_dir) / "检出结果" / "复判.json"
+                       if out_dir else Path.cwd() / "复判.json")
+        from .batch_review_dialog import BatchReviewDialog
+
+        old = getattr(self, "_review_dialog", None)
+        if old is not None:
+            try:
+                old.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._review_dialog = BatchReviewDialog(
+            results, getattr(self, "_last_match_stats", None), review_path,
+            dataset_dir=self._resolve_dataset_dir(), parent=self)
+        self._review_dialog.show()
+
+    def _open_model_compare(self):
+        """O21（V0.7）：模型 A/B 比对窗（非模态；B 模型复推在后台线程）。"""
+        results = getattr(self, "_last_batch_results", None)
+        if not results:
+            QMessageBox.information(self, "A/B 比对", "请先完成一次批量推理")
+            return
+        ctx = getattr(self, "_review_ctx", None)
+        if ctx:
+            conf, iou = float(ctx["conf"]), float(ctx["iou"])
+            classes = list(ctx["classes"] or [])
+        else:
+            conf, iou = self._current_params()
+            classes = self.classes or []
+        from .model_compare_dialog import ModelCompareDialog
+
+        old = getattr(self, "_ab_dialog", None)
+        if old is not None:
+            try:
+                old.close()
+            except Exception:  # noqa: BLE001
+                pass
+        w = getattr(self, "_loaded_weights_path", None)
+        self._ab_dialog = ModelCompareDialog(
+            results, getattr(self, "_batch_out_dir", None), conf, iou,
+            self._flow, classes,
+            model_a_name=Path(w).name if w else "", parent=self)
+        self._ab_dialog.show()
 
     def _on_batch_failed(self, message: str):
         self.btn_batch.setEnabled(True)
@@ -834,6 +1148,25 @@ class TestingWindow(QMainWindow):
             log.error("推理失败: %s: %s", type(e).__name__, e, exc_info=True)
             QMessageBox.critical(self, "推理失败", f"{type(e).__name__}: {e}")
             return
+        if self._flow and self.task != "classification":
+            from ..engine.flow.legacy_adapter import apply_flow_safe
+
+            try:
+                prediction, flow_info = apply_flow_safe(
+                    prediction, (image.shape[1], image.shape[0]), self._flow,
+                    classes=self.classes or None)
+                self._flow_info = flow_info
+                log.info("检出流程: 原始 %d → 过滤后 %d（判定 %s）",
+                         len(prediction.boxes) + flow_info.get("removed", 0),
+                         len(prediction.boxes), flow_info.get("count_check"))
+            except Exception as e:
+                # 流程应用失败只降级为不过滤，绝不打断推理
+                self._flow_info = None
+                log.error("检出流程应用失败，已跳过过滤: %s: %s",
+                          type(e).__name__, e, exc_info=True)
+                self.result_stats.setText("检出流程应用失败（已跳过过滤），详见日志")
+        else:
+            self._flow_info = None
         self._last_infer_cost = time.perf_counter() - t0
         # 每次单图推理留痕（用户回传"推理变慢"排障依据：耗时/检出数/阈值可与环境对照）
         _boxes = getattr(prediction, "boxes", None)  # 判空不用真值（P150）
@@ -883,7 +1216,8 @@ class TestingWindow(QMainWindow):
         try:
             rendered = draw_predictions(image, prediction, self.classes, self.task,
                                         show_labels=self.show_labels.isChecked(),
-                                        show_masks=self.show_masks.isChecked() and self.task == "segmentation")
+                                        show_masks=self.show_masks.isChecked()
+                                        and self.task in ("segmentation", "anomaly"))
             self._set_canvas_image(rendered)
             self._fill_result_list(prediction)
         except Exception as e:
@@ -906,6 +1240,11 @@ class TestingWindow(QMainWindow):
         else:
             shown = len(prediction.boxes)
             extra = ""
+            if self._flow_info:
+                extra += f"（流程移除 {self._flow_info.get('removed', 0)} 个）"
+                verdict = self._flow_info.get("count_check")
+                if verdict:
+                    extra += f"\n数量判定：{verdict}"
             if self.class_filter.currentData() is not None and total:
                 self.result_stats.setText(
                     f"{name}\n检出目标：{total} 个（筛选后显示 {shown} 个）{extra}{cost_txt}")
@@ -929,11 +1268,14 @@ class TestingWindow(QMainWindow):
                 self.result_list.addItem(f"{name}　{prob:.1%}")
             return
         show_area = self.show_area.isChecked()
+        texts = getattr(prediction, "texts", None)   # A2（V0.7）：OCR 识别文本
         for i, (box, idx, score) in enumerate(zip(prediction.boxes, prediction.labels,
                                                   prediction.scores)):
             name = self.classes[idx] if idx < len(self.classes) else str(idx)
             x1, y1, x2, y2 = (int(round(v)) for v in box)
             text = f"{name}　{score:.2f}　[{x1},{y1},{x2},{y2}]"
+            if texts is not None and i < len(texts):
+                text += f"　「{texts[i]}」"
             if show_area:
                 if prediction.masks is not None and i < len(prediction.masks):
                     text += f"　面积 {int(prediction.masks[i].sum())} px"

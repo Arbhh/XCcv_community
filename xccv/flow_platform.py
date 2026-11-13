@@ -604,6 +604,14 @@ class FlowPage(QWidget):
             return None
         return self.data_root / val
 
+    def _pick_image_dialog(self) -> Path | None:
+        """无选图时的兜底：直接弹文件选择器。"""
+        start = str(self.data_root) if self.data_root is not None else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择用于运行预览的图片", start,
+            "图片 (*.jpg *.jpeg *.png *.bmp *.tif *.tiff);;所有文件 (*)")
+        return Path(path) if path else None
+
     _THUMB_CACHE_MAX = 32  # 预览解码缓存上限（T2-3：来回点选不重复解码）
 
     def _on_tree_click(self, item: QTreeWidgetItem, _col: int):
@@ -905,11 +913,18 @@ class FlowPage(QWidget):
         flow = self._read_flow()
         if flow is None:
             return
-        if self._is_xcv_flow(flow):
-            img_path = self._selected_image()
+        # 选图守卫必须先于模型加载（避免数十秒加载后才发现没选图）
+        img_path = self._selected_image()
+        if img_path is None:
+            ret = QMessageBox.question(
+                self, "运行流程",
+                "尚未选择图片。是否现在选择一张图片用于运行预览？\n"
+                "（取消 = 打开数据路径后双击图片再运行）")
+            if ret == QMessageBox.Yes:
+                img_path = self._pick_image_dialog()
             if img_path is None:
-                self.window().statusBar().showMessage("请先在左侧选择一张图片", 4000)
                 return
+        if self._is_xcv_flow(flow):
             self._run_flow_xcv(flow, img_path)
             return
         try:
@@ -921,10 +936,6 @@ class FlowPage(QWidget):
         if model is None:
             self.window().statusBar().showMessage(
                 "流程中没有已选择权重文件的模型节点（请先编辑流程）", 6000)
-            return
-        img_path = self._selected_image()
-        if img_path is None:
-            self.window().statusBar().showMessage("请先在左侧选择一张图片", 4000)
             return
         img = imread_unicode(str(img_path))
         if img is None:

@@ -67,6 +67,10 @@ class Project:
     train_input: int = 0           # T9-2 两段式缩放（R-CNN 家族 opt-in，0=跟随画布）
     tiling: bool = False           # T9-3 切图训练（大图小目标；推理需配分块推理）
     tile_size: int = 640           # 切图训练 tile 边长
+    use_negatives: bool = True     # 负样本：OK/良品 等文件夹内未标注图作背景训练（压误检）
+    p2_head: bool = False          # P2 小目标检测头（YOLO 家族，默认关；其他家族忽略）
+    color_mode: str = "color"      # O5（V0.7）：训练颜色模式 color/gray（灰度防颜色干扰）
+    deterministic: bool = False    # E3（V0.7）：确定性训练 opt-in（同机同种子可复现；有性能损失）
     tf32: bool = True              # GPU 提速：TF32 + cuDNN 自动调优（仅 GPU 生效）
     save_epoch_weights: bool = True  # 逐轮保存权重到共用 epoch_weights 文件夹（覆盖式）
     created_at: str = ""

@@ -17,14 +17,18 @@ from pathlib import Path
 
 from .base import Sample, TaskType
 from .converters import split_samples
-from .reader import scan_classification_dataset, scan_labelme_dataset
+from .ignore import filter_ignore_shapes
+from .reader import scan_classification_dataset, scan_labelme_dataset, scan_negative_images
 
 log = logging.getLogger(__name__)
 
+# 训练集负样本图数上限 = 标注图数 × 该倍数（超出按种子随机抽取，防背景淹没缺陷）
+NEGATIVE_CAP_RATIO = 1.0
+
 # 模型家族 -> 支持的任务
 FAMILY_TASKS = {
-    "folder": {TaskType.CLASSIFICATION},
-    "yolo": {TaskType.DETECTION, TaskType.SEGMENTATION},
+    "folder": {TaskType.CLASSIFICATION, TaskType.ANOMALY},
+    "yolo": {TaskType.DETECTION, TaskType.SEGMENTATION, TaskType.OCR},
     "coco": {TaskType.DETECTION, TaskType.SEGMENTATION},
 }
 
@@ -61,6 +65,10 @@ class PreparedData:
     val_samples: list[Sample] = field(default_factory=list)
     augment_ops: dict = field(default_factory=dict)
     augment_probs: dict = field(default_factory=dict)  # 每算子启用概率，缺失按 0.5
+    neg_train_count: int = 0   # 负样本（OK 图）进入训练/验证的图数（倍增前）
+    neg_val_count: int = 0
+    ignore_regions: int = 0    # O8（V0.7）：`__ignore__` 忽略区域数
+    ignore_dropped: int = 0    # O8：因与 ignore 区域重叠>50% 被剔除的 GT 实例数
 
     @property
     def data_yaml(self) -> Path:
@@ -94,6 +102,7 @@ def prepare(
     augment_ops: dict | None = None,
     train_ratio: float | None = None,
     augment_probs: dict | None = None,
+    use_negatives: bool = False,
 ) -> PreparedData:
     """从平台固定结构的数据集目录做内存数据准备（不写任何文件）。
 
@@ -101,22 +110,46 @@ def prepare(
     次数）；增强按随机概率启用，与该值无关；val_ratio=0 时验证集复用训练集
     保证指标曲线可用；train_ratio 语义见 split_samples（None=1-val_ratio，
     与 val_ratio 之和 >1 时允许重叠）。
+    use_negatives（检测/分割）：负样本文件夹（OK/良品/负样本/背景…）内的
+    未标注图作纯背景样本加入训练与验证——压误检；独立划分，标注图的
+    划分结果与关闭时完全一致。
     """
     task = TaskType(task)
     if task not in FAMILY_TASKS[family]:
         raise ValueError(f"模型家族 {family} 不支持任务 {task.label}")
     augment_ops = dict(augment_ops or {})
     dataset_dir = Path(dataset_dir)
+    neg_train: list[Sample] = []
+    neg_val: list[Sample] = []
+    n_regions = n_dropped = 0   # O8：folder 族无实例标注，恒为 0
 
-    if task is TaskType.CLASSIFICATION:
+    if family == "folder":  # 分类与无监督异常检测同族：按目录名扫描
         samples, classes = scan_classification_dataset(dataset_dir)
         train, val = split_samples(samples, val_ratio, seed, stratify=True,
                                    train_ratio=train_ratio)
     else:
         samples, classes, _ = scan_labelme_dataset(dataset_dir)
+        # O8（V0.7）：`__ignore__` 忽略区域近似语义——单点过滤（YOLO/R-CNN/
+        # OCR 三族共同的样本咽喉；忽略区域与重叠>50% 的 GT 在进训练前剔除）
+        for s in samples:
+            kept, nr, nd = filter_ignore_shapes(s.shapes)
+            if nr:
+                s.shapes = kept
+                n_regions += nr
+                n_dropped += nd
+        if n_regions:
+            log.info("忽略区域: %d 个 __ignore__ 标注，剔除重叠>50%% 的 GT 实例 "
+                     "%d 个（近似语义：区域内背景负样本仍参与学习，见操作手册）",
+                     n_regions, n_dropped)
         train, val = split_samples(samples, val_ratio, seed,
                                    train_ratio=train_ratio, stratify_labels=True)
-    train = _multiply(train, multiply_factor)
+        if use_negatives:
+            neg_train, neg_val = _split_negatives(
+                dataset_dir, len(train), val_ratio, seed, train_ratio)
+            train = train + neg_train
+            val = val + neg_val
+    train = _multiply(train, multiply_factor) if task is not TaskType.ANOMALY \
+        else list(train)  # 异常检测单遍学习，不做数据倍增
 
     if not classes:
         raise ValueError(f"数据集 {dataset_dir} 中未发现任何类别标注，请先标注或检查目录结构")
@@ -133,10 +166,36 @@ def prepare(
         "、".join(augment_ops) or "未启用")
     log.info("类别实例分布 — 训练集: %s | 验证集: %s（不均衡时建议开启工业优化）",
              _counts(train), _counts(val))
+    if use_negatives and family in ("yolo", "coco"):
+        log.info("负样本（OK 图）: 训练 %d 张 / 验证 %d 张（倍增前；文件夹名 OK/良品/"
+                 "负样本/背景 等内的未标注图）", len(neg_train), len(neg_val))
     return PreparedData(task=task, classes=classes, train_count=len(train),
                         val_count=len(val), family=family, dataset_dir=dataset_dir,
                         train_samples=train, val_samples=val, augment_ops=augment_ops,
-                        augment_probs=dict(augment_probs or {}))
+                        augment_probs=dict(augment_probs or {}),
+                        neg_train_count=len(neg_train), neg_val_count=len(neg_val),
+                        ignore_regions=n_regions, ignore_dropped=n_dropped)
+
+
+def _split_negatives(dataset_dir: Path, n_labeled_train: int, val_ratio: float,
+                     seed: int, train_ratio: float | None):
+    """负样本独立划分（种子与标注图错开，标注图划分不受影响）。
+
+    训练侧超过 标注图数×NEGATIVE_CAP_RATIO 时按种子随机抽取；验证侧不设
+    上限（误检率评估要看全部抽中的 OK 图）。
+    """
+    negs = scan_negative_images(dataset_dir)
+    if not negs:
+        log.info("负样本已启用，但数据集中未找到负样本文件夹（OK/良品/负样本/背景 等）"
+                 "内的未标注图片")
+        return [], []
+    neg_train, neg_val = split_samples(negs, val_ratio, seed + 1,
+                                       train_ratio=train_ratio)
+    cap = int(round(max(n_labeled_train, 1) * NEGATIVE_CAP_RATIO))
+    if len(neg_train) > cap:
+        neg_train = random.Random(seed + 2).sample(neg_train, cap)
+        log.info("负样本多于标注图 ×%.1f：训练侧随机抽取 %d 张", NEGATIVE_CAP_RATIO, cap)
+    return neg_train, neg_val
 
 
 def _multiply(samples: list[Sample], factor: int) -> list[Sample]:

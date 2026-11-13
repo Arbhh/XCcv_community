@@ -31,7 +31,8 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QScrollArea, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
+    QScrollArea, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from ..engine.dataset import IMAGE_EXTS
@@ -39,15 +40,15 @@ from ..engine.dataset.base import TaskType
 from ..engine.dataset.reader import scan_classification_dataset, scan_labelme_dataset
 from ..engine.io_utils import imread_unicode
 from ..gui_utils import auto_cleanup_thread, ensure_console_streams
-from .charts import ConfusionMatrixCanvas, DistributionCanvas
+from .charts import ConfusionMatrixCanvas, DistributionCanvas, SplitDonutCanvas
 from .data_health import LEVEL_WARN, run_health_check
 from .dataset_stats import collect_stats
 from .dialogs import CollapsibleSection, DevOptionsDialog, HealthReportDialog, ReportRow
 from .dev_options import load_options
 from .preflight import dataset_facts, param_findings, recommend_settings
 from .project import (
-    Project, create_project, delete_project, list_pruned_models, list_projects,
-    load_project, migrate_history, save_project,
+    Project, create_project, delete_project, list_projects,
+    load_project, save_project,
 )
 from .runs import RunRecord, format_duration, scan_runs, STATUS_COLOR
 from ..ui_style import APP_QSS, ACCENT, bind_style, icon_path, token  # noqa: F401  APP_QSS/ACCENT 保留兼容
@@ -60,6 +61,8 @@ _TASK_MODEL_ICON = {
     TaskType.CLASSIFICATION: "model_classification.png",
     TaskType.DETECTION: "model_detection.png",
     TaskType.SEGMENTATION: "model_segmentation.png",
+    TaskType.ANOMALY: "model_classification.png",  # A1：无监督复用分类图标
+    TaskType.OCR: "model_classification.png",      # A2：OCR 复用分类图标
 }
 from .trainer_thread import TrainThread
 
@@ -116,6 +119,8 @@ _TASK_BADGES = {
     TaskType.CLASSIFICATION: ("badge", "图像分类"),
     TaskType.DETECTION: ("badgeDet", "目标检测"),
     TaskType.SEGMENTATION: ("badgeSeg", "实例分割"),
+    TaskType.ANOMALY: ("badge", "无监督异常检测"),  # A1（V0.7）
+    TaskType.OCR: ("badge", "OCR 字符识别"),        # A2（V0.7）
 }
 
 _ILLEGAL_NAME_CHARS = re.compile(r'[\\/:*?"<>|]')
@@ -446,9 +451,29 @@ class _PreflightWorker(QThread):
             report = run_health_check(
                 task, d, opt, val_ratio=float(p.val_ratio), seed=42,
                 train_ratio=getattr(p, "train_ratio", None) or None, scan=scan)
+            issues = list(report.issues)
+            # O4（V0.7）：缩放后实例像素尺寸校验（YOLO=letterbox、R-CNN=stretch）
+            if task in (TaskType.DETECTION, TaskType.SEGMENTATION):
+                from .data_health import HealthIssue, LEVEL_WARN
+                from .scale_guard import scale_issue, scale_issue_text
+
+                resize = (p.augment_ops or {}).get("resize") or {}
+                w = int(resize.get("width", 0) or 0)
+                h = int(resize.get("height", 0) or 0)
+                if str(p.model_name or "").startswith("yolo"):
+                    mode = "letterbox"   # YOLO 忽略 resize 增强只取长边（P210）
+                    w = h = (max(w, h) or 640)
+                else:
+                    mode = "stretch"
+                stat = scale_issue(samples, mode, w, h)
+                txt = scale_issue_text(stat) if stat else None
+                if txt:
+                    issues.append(HealthIssue(
+                        LEVEL_WARN, "small_instance",
+                        "缩放后过小实例占比偏高", txt[0], txt[1]))
             findings = param_findings(p, dataset_facts(samples),
                                       _cuda_available())
-            self.done.emit({"issues": report.issues, "findings": findings,
+            self.done.emit({"issues": issues, "findings": findings,
                             "n_images": report.n_images, "classes": report.classes})
         except Exception as e:  # 预检失败不阻塞训练（训练线程另有校验兜底）
             self.failed.emit(f"{type(e).__name__}: {e}")
@@ -591,7 +616,20 @@ class ProjectWindow(QMainWindow):
         v2.addLayout(head2)
         self.dist_canvas = DistributionCanvas()
         v2.addWidget(self.dist_canvas)
+        # O12（V0.7）：训练/验证划分环形图（随统计刷新）
+        self.split_canvas = SplitDonutCanvas()
+        self.split_canvas.setMaximumHeight(240)
+        v2.addWidget(self.split_canvas)
         lay.addWidget(g2)
+
+        # O11（V0.7）：数据网格（缩略图墙；后台扫描+懒加载缩略+LRU）
+        g2b = QGroupBox("数据网格（双击图片用系统看图打开）")
+        v2b = QVBoxLayout(g2b)
+        from .data_grid import get_data_grid_class
+
+        self.data_grid = get_data_grid_class()()
+        v2b.addWidget(self.data_grid)
+        lay.addWidget(g2b)
 
         # 图像增强策略
         g3 = QGroupBox("图像增强策略（勾选后启用；用于数据倍增与随机变化）")
@@ -800,6 +838,16 @@ class ProjectWindow(QMainWindow):
             "T9-5 slim 头：FPN 64 通道+两层 256 FC+4×64 掩码头（约 12.5M 参数），\n"
             "可加载 mmdet 预训练权重；\n"
             "显存占用约为标准头一半，小数据集收敛更快。仅在使用 maskrcnn18 时生效")
+        self.par_p2 = QCheckBox("P2 小目标检测头（仅 YOLO 家族生效）")
+        self.par_p2.setToolTip(
+            "在所选 YOLO 模型（n/s，检测/分割）上增加 stride 4 的第四检测层，\n"
+            "面向短边 ≤8px 的微小缺陷；骨干/颈部/原检测分支继承官方预训练，\n"
+            "仅新增的 P2 分支从头学习，建议适当增加训练轮次；\n"
+            "显存约为普通模型的 2 倍（1920 输入 n-seg 批量 4 约 13 GiB），\n"
+            "显存不足请减小批量；训练产物自带结构，测试/部署无需再勾选；\n"
+            "迁移学习/从剪枝模型继续训练时沿用起始权重的结构，本开关不生效。\n"
+            "R-CNN 与分类模型忽略该选项")
+        self.par_p2.toggled.connect(self._refresh_input_size_hint)
         # R-CNN 优化器三件套
         self.par_rcnn_opt = _Combo()
         self.par_rcnn_opt.addItem("AdamW（推荐）", "adamw")
@@ -832,6 +880,7 @@ class ProjectWindow(QMainWindow):
         self.par_epoch_w.setToolTip(
             "每次训练共用「模型储存路径\\epoch_weights」文件夹，逐轮保存权重：\n"
             "训练开始时清空旧训练的轮次权重（覆盖式，只占最近一次训练的空间）；\n"
+            ""
             "轮次权重可在测试平台直接加载对比")
         self.par_patience = _Spin()
         self.par_patience.setRange(0, 200)
@@ -843,6 +892,28 @@ class ProjectWindow(QMainWindow):
             "背景 tile 按 15% 保留、10% 原图整图混入、验证集始终整图评估；\n"
             "**推理必须配合分块**：测试平台「4K 大图分块推理」或服务 tiled=true\n"
             "（与 T9-2 两段式缩放互斥使用更清晰：切图训练时不建议再设网络输入尺寸）")
+        self.par_neg = QCheckBox("负样本训练（OK 图降误检，检测/分割）")
+        self.par_neg.setChecked(True)
+        self.par_neg.setToolTip(
+            "数据集中「OK / 良品 / 正常 / 合格 / 负样本 / 背景」等文件夹里的\n"
+            "未标注图片会作为纯背景样本参与训练与验证（默认开启）：\n"
+            "模型学到「这些图上什么都不该检出」，直接压低误检率；\n"
+            "训练日志与历史记录会给出负样本张数与 OK 图误检率指标；\n"
+            "标注图划分不受影响；负样本图数超过标注图数时会自动抽样到 1:1")
+        # O5（V0.7）：颜色模式（灰度/彩色）——颜色无判别意义时用灰度防干扰
+        self.par_gray = QCheckBox("灰度训练（颜色无判别意义时防颜色干扰）")
+        self.par_gray.setToolTip(
+            "开启后训练读图统一转灰度（复制 3 通道，骨干零改动），\n"
+            "推理/部署侧按权重内记录自动同口径转灰；\n"
+            "适合颜色不携带判别信息、打光颜色易漂移的工业场景；\n"
+            "对检测/分割/分类家族生效（YOLO 推理侧加速导出暂不透传该标记）")
+        # E3（V0.7）：确定性训练 opt-in
+        self.par_det = QCheckBox("确定性训练（可复现，默认关）")
+        self.par_det.setToolTip(
+            "开启后固定全部随机种子并启用确定性算法（CUBLAS_WORKSPACE_CONFIG\n"
+            ":4096:8 + torch.use_deterministic_algorithms）：同机同种子同依赖\n"
+            "版本两次训练指标一致，run_manifest.json 标记 deterministic=true；\n"
+            "代价：训练速度下降、个别算子不支持确定性实现时降级告警（不中断）")
         self.par_tile_size = _Spin()
         self.par_tile_size.setRange(256, 2048)
         self.par_tile_size.setSingleStep(32)
@@ -859,8 +930,8 @@ class ProjectWindow(QMainWindow):
             "仅 R-CNN 家族生效；推理侧请配合测试平台「4K 大图分块推理」\n"
             "或服务 tiled=true（与切图训练 T9-3 配对使用效果最佳）")
         self.par_transfer = QCheckBox("迁移学习（从已有模型权重开始训练）")
-        self.par_transfer.setToolTip("勾选后通过文件选择器指定起始权重（.pt，"
-                                     "含历史训练记录的 best 权重）；"
+        self.par_transfer.setToolTip("勾选后通过文件选择器指定起始权重（支持 .pt，"
+                                     "含剪枝模型与历史训练记录的 best 权重）；"
                                      "类别需与当前数据集一致")
         self.par_transfer.toggled.connect(self._on_transfer_toggled)
         transfer_row = QHBoxLayout()
@@ -913,6 +984,7 @@ class ProjectWindow(QMainWindow):
         fd.addRow("网络输入尺寸（可选）", self.par_train_input)
         fd.addRow(self.par_tiling)
         fd.addRow("切图 tile 边长", self.par_tile_size)
+        fd.addRow(self.par_neg)
         fd.addRow("训练集比例", self.par_train_ratio)
         fd.addRow("验证集比例", self.par_val_ratio)
         fd.addRow("数据倍增倍数", self.par_multiply)
@@ -932,6 +1004,9 @@ class ProjectWindow(QMainWindow):
         fa.addRow(self.par_mask_light)
         fa.addRow(self.par_anchor)
         fa.addRow(self.par_slim_head)
+        fa.addRow(self.par_p2)
+        fa.addRow(self.par_gray)  # O5（V0.7）：颜色模式
+        fa.addRow(self.par_det)   # E3（V0.7）：确定性训练
         fa.addRow("R-CNN 优化器", self.par_rcnn_opt)
         fa.addRow("R-CNN 学习率", self.par_rcnn_lr)
         fa.addRow("R-CNN 权重衰减", self.par_rcnn_wd)
@@ -1139,6 +1214,23 @@ class ProjectWindow(QMainWindow):
         v2 = QVBoxLayout(g2)
         self.cm_canvas = ConfusionMatrixCanvas()
         v2.addWidget(self.cm_canvas)
+        # O1（V0.7）：逐类精确率/召回率表（VIMO"类型详情表"对照项）
+        self.per_class_table = QTableWidget(0, 9)
+        self.per_class_table.setHorizontalHeaderLabels(
+            ["类别", "GT 实例", "检出", "TP", "FP", "FN", "精确率", "召回率", "AP@50"])
+        self.per_class_table.horizontalHeader().setStretchLastSection(True)
+        self.per_class_table.verticalHeader().setVisible(False)
+        self.per_class_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.per_class_table.setMaximumHeight(190)
+        self.per_class_table.setToolTip(
+            "口径说明：\n"
+            "· TP/FP/FN 来自 IoU≥0.5 同类匹配混淆矩阵（训练收尾统计）；\n"
+            "· 精确率=TP/检出，召回率=TP/GT 实例；检出=TP+FP，GT 实例=TP+FN；\n"
+            "· AP@50 为 COCO 口径逐类平均（与汇总 mAP@50 同口径）；\n"
+            "· 曲线/摘要的 mAP・mAR 为宽松口径（IoU 0.10/0.25/0.50 三档平均），\n"
+            "  两套口径并存，调优时先确认目标再对号入座；\n"
+            "· \"-\" 表示该类无样本或无有效评估组合。")
+        v2.addWidget(self.per_class_table)
         lay2.addWidget(g2)
 
         g3 = QGroupBox("本次训练参数")
@@ -1178,6 +1270,9 @@ class ProjectWindow(QMainWindow):
         self.info_name.setText(p.name)
         self.info_dataset.setText(p.dataset_dir)
         self.info_model_dir.setText(p.model_dir)
+        dg = getattr(self, "data_grid", None)
+        if dg is not None:      # O11（V0.7）：数据网格随项目刷新
+            dg.set_dataset(p.dataset_dir)
         # 快照源字典：循环内 setChecked/setValue 会同步触发 _collect_augment_ops
         # 把 project.augment_ops 替换为当前 UI 状态，若边读边写，未处理的算子
         # 会被当作"不存在"而漏勾选（rotate90 行曾因此丢失）
@@ -1241,6 +1336,7 @@ class ProjectWindow(QMainWindow):
         self.par_mask_light.setChecked(getattr(p, "mask_head_light", False))
         self.par_anchor.setChecked(getattr(p, "anchor_small", False))
         self.par_slim_head.setChecked(getattr(p, "slim_head", False))
+        self.par_p2.setChecked(getattr(p, "p2_head", False))
         _ri = self.par_rcnn_opt.findData(
             getattr(p, "rcnn_optimizer", "adamw"))
         self.par_rcnn_opt.setCurrentIndex(max(_ri, 0))
@@ -1253,6 +1349,9 @@ class ProjectWindow(QMainWindow):
         self.par_train_input.setValue(getattr(p, "train_input", 0))
         self.par_tiling.setChecked(getattr(p, "tiling", False))
         self.par_tile_size.setValue(getattr(p, "tile_size", 640))
+        self.par_neg.setChecked(getattr(p, "use_negatives", True))
+        self.par_gray.setChecked(getattr(p, "color_mode", "color") == "gray")
+        self.par_det.setChecked(getattr(p, "deterministic", False))
         # Quick 档控件同步填充 + 默认值快照（「恢复默认」与推荐徽章复位用）
         self._fill_quick_controls()
         self._param_defaults = {
@@ -1297,6 +1396,9 @@ class ProjectWindow(QMainWindow):
             return
         self.setWindowTitle(f"{p.name}  -  训练平台")
         self.det_title.setText(p.name)
+        dg = getattr(self, "data_grid", None)
+        if dg is not None:      # O11：数据集路径可能被修改
+            dg.set_dataset(p.dataset_dir)
         if self.on_renamed is not None:
             self.on_renamed(old_name, p.name)
         toast(self, "项目信息已保存", "success")
@@ -1324,6 +1426,7 @@ class ProjectWindow(QMainWindow):
         p.mask_head_light = self.par_mask_light.isChecked()
         p.anchor_small = self.par_anchor.isChecked()
         p.slim_head = self.par_slim_head.isChecked()
+        p.p2_head = self.par_p2.isChecked()
         p.rcnn_optimizer = self.par_rcnn_opt.currentData()
         p.rcnn_learning_rate = self.par_rcnn_lr.value()
         p.rcnn_weight_decay = self.par_rcnn_wd.value()
@@ -1334,6 +1437,9 @@ class ProjectWindow(QMainWindow):
         p.train_input = self.par_train_input.value()
         p.tiling = self.par_tiling.isChecked()
         p.tile_size = self.par_tile_size.value()
+        p.use_negatives = self.par_neg.isChecked()
+        p.color_mode = "gray" if self.par_gray.isChecked() else "color"
+        p.deterministic = self.par_det.isChecked()
         if p.train_input > 960:
             # T9-6：opt-in 大输入提示（显存显著上升）
             self.statusBar().showMessage(
@@ -1353,6 +1459,8 @@ class ProjectWindow(QMainWindow):
         name = self.par_model.currentData()
         if name and name in DEFAULT_LR:
             self.par_lr.setValue(DEFAULT_LR[name])
+        if hasattr(self, "augment_controls"):
+            self._refresh_input_size_hint()   # P2 显存提示只对 YOLO 模型显示
 
     # ---- 训练输入尺寸（与增强 resize 统一） ----
     def _current_resize(self) -> tuple[int, int] | None:
@@ -1368,6 +1476,12 @@ class ProjectWindow(QMainWindow):
             self.input_size_hint.setText(f"{size[0]} × {size[1]}　（随增强策略 resize 设置）")
         else:
             self.input_size_hint.setText("模型默认　（未启用 resize，分类将拉伸为方形）")
+        name = getattr(getattr(self, "par_model", None), "currentData", lambda: None)() or ""
+        p2 = getattr(self, "par_p2", None)
+        if (isinstance(name, str) and name.startswith("yolo")
+                and p2 is not None and p2.isChecked()):
+            tip = self.input_size_hint.text()
+            self.input_size_hint.setText(tip + "　· P2 小目标头：显存约 ×2，建议减小批量")
         if getattr(self, "q_size", None) is not None:
             self._sync_quick_size()   # Quick 档「输入尺寸」行同步
 
@@ -1452,11 +1566,25 @@ class ProjectWindow(QMainWindow):
         th.start()
 
     def _on_stats_done(self, stats):
+        n_ok = getattr(stats, "n_ok", 0)
+        total = stats.n_images + n_ok
+        ok_part = ""
+        if n_ok and total:
+            pct = n_ok / total
+            ok_part = f"，OK 负样本 {n_ok} 张（占比 {pct:.0%}）"
+        # O8（V0.7）：忽略区域计数可见（与数据体检提示同口径）
+        n_ign = getattr(stats, "n_ignore", 0)
+        if n_ign:
+            ok_part += f"，__ignore__ 区域 {n_ign} 个"
         self.stats_hint.setText(
-            f"共 {stats.n_images} 张图片，已标注 {stats.n_labeled} 张，"
-            f"类别 {len(stats.class_counts)} 个"
+            f"共 {total} 张图片，已标注 {stats.n_labeled} 张，"
+            f"类别 {len(stats.class_counts)} 个{ok_part}"
         )
         self.dist_canvas.update_stats(stats)
+        # O12（V0.7）：划分环形图（n_ok 含负样本；分类任务 n_ok=0）
+        self.split_canvas.update_split(
+            stats.n_labeled, getattr(stats, "n_ok", 0),
+            float(self.project.val_ratio or 0.0))
 
     def _on_stats_failed(self, msg):
         self.stats_hint.setText("")
@@ -1528,6 +1656,8 @@ class ProjectWindow(QMainWindow):
             self.par_rpn.setChecked(True)
         elif key == "use_amp":
             self.par_amp.setChecked(bool(value))
+        elif key == "epochs":  # O7（V0.7）：轮次智能推荐
+            self.par_epochs.setValue(int(value))
         elif key == "augment_probs":  # 已启用算子的概率提高到推荐值
             for op, prob in self.augment_prob_spins.items():
                 if self.augment_controls[op][0].isChecked():
@@ -1917,6 +2047,7 @@ class ProjectWindow(QMainWindow):
         self.cm_canvas.ax.clear()
         self.cm_canvas.draw()
         self.final_metrics.setText("")
+        self._update_per_class_table(None)  # O1：新训练开始前清空逐类表
         self._build_echo_form(run_dir=run_dir)
         self.train_status.setText("训练中…")
         self.btn_start.setEnabled(False)
@@ -1950,6 +2081,7 @@ class ProjectWindow(QMainWindow):
                 ("轻量掩码头", "是" if p.mask_head_light else "否"),
         ("slim 头", "是" if getattr(p, "slim_head", False) else "否"),
         ("小目标锚框", "是" if getattr(p, "anchor_small", False) else "否"),
+        ("P2 检测头", "是" if getattr(p, "p2_head", False) else "否"),
                 ("AMP 混合精度", "开启" if p.use_amp else "关闭"),
                 ("GPU 提速(TF32)", "开启" if p.tf32 else "关闭"),
                 ("轮次权重", epoch_w),
@@ -1958,6 +2090,9 @@ class ProjectWindow(QMainWindow):
                 ("模型储存路径", p.model_dir), ("输出目录", out_dir),
                 ("训练集比例", f"{getattr(p, 'train_ratio', 0):.0%}"),
                 ("验证集比例", f"{p.val_ratio:.0%}"), ("每轮重复学习", f"{p.multiply_factor} 遍"),
+                ("负样本训练", "启用" if getattr(p, "use_negatives", True) else "关闭"),
+                ("颜色模式", "灰度" if getattr(p, "color_mode", "color") == "gray" else "彩色"),
+                ("确定性训练", "开启" if getattr(p, "deterministic", False) else "关闭"),
                 ("增强策略", aug), ("批量大小", str(p.batch_size)),
                 ("训练轮次", str(p.epochs)), ("学习率", f"{p.learning_rate:g}"),
                 ("权重衰减", f"{p.weight_decay:g}"), ("评估间隔", f"每 {p.eval_interval} 轮"),
@@ -1977,6 +2112,7 @@ class ProjectWindow(QMainWindow):
                 ("轻量掩码头", "是" if config.get("mask_head_light") else "否"),
         ("slim 头", "是" if config.get("slim_head") else "否"),
         ("小目标锚框", "是" if config.get("anchor_small") else "否"),
+        ("P2 检测头", "是" if config.get("p2_head") else "否"),
                 ("AMP 混合精度", "开启" if config.get("use_amp", True) else "关闭"),
                 ("GPU 提速(TF32)", "开启" if config.get("tf32", True) else "关闭"),
                 ("轮次权重", epoch_w),
@@ -1986,6 +2122,9 @@ class ProjectWindow(QMainWindow):
                 ("训练集比例", f"{config.get('train_ratio', 0) or round(1 - config.get('val_ratio', 0.2), 2):.0%}"),
                 ("验证集比例", f"{config.get('val_ratio', 0):.0%}"),
                 ("每轮重复学习", f"{config.get('multiply_factor', 1)} 遍"),
+                ("负样本训练", "启用" if config.get("use_negatives", True) else "关闭"),
+                ("颜色模式", "灰度" if config.get("color_mode", "color") == "gray" else "彩色"),
+                ("确定性训练", "开启" if config.get("deterministic", False) else "关闭"),
                 ("增强策略", aug),
                 ("批量大小", str(config.get("batch_size", "—"))),
                 ("训练轮次", str(config.get("epochs", "—"))),
@@ -2081,7 +2220,7 @@ class ProjectWindow(QMainWindow):
             self.run_end.setText("—")
             self._tick_duration()
         else:
-            self._history = migrate_history(m.get("history") or [])
+            self._history = list(m.get("history") or [])
             self._build_echo_form(config=m.get("config"), run_dir=rec.run_dir)
             self._update_progress(rec.epochs_done, rec.epochs_planned)
             self.run_start.setText(rec.start_time or "—")
@@ -2094,6 +2233,7 @@ class ProjectWindow(QMainWindow):
             self.final_metrics.setText("")
             self.cm_canvas.ax.clear()
             self.cm_canvas.draw()
+            self._update_per_class_table(None)  # O1：进行中无逐类指标
             self.btn_delete_run.setEnabled(False)  # 进行中的记录不可删除
         else:
             self.train_status.setText(f"历史记录：{rec.status_text}")
@@ -2107,6 +2247,7 @@ class ProjectWindow(QMainWindow):
                 self.cm_canvas.update_matrix(matrix, classes)
             else:
                 self.cm_canvas.draw()
+            self._update_per_class_table(m)  # O1：历史详情逐类表
             self.btn_delete_run.setEnabled(True)
 
     def _update_progress(self, done: int, planned: int):
@@ -2262,12 +2403,49 @@ class ProjectWindow(QMainWindow):
             classes = metrics.get("classes") or []
             if matrix:
                 self.cm_canvas.update_matrix(matrix, classes)
+            self._update_per_class_table(metrics)  # O1：训练完成即出逐类表
         else:
             self.train_status.setText("训练失败 ✘")
             self.final_metrics.setText(f"失败原因：{message}")
+            self._update_per_class_table(None)
             QMessageBox.critical(self, "训练失败", message)
         # 重扫历史（本次训练目录已有产出），保持选中该记录展示最终详情
         self._reload_history(select_dir=self._run_dir)
+
+    def _update_per_class_table(self, metrics: dict | None):
+        """O1（V0.7）：逐类精确率/召回率表刷新。
+
+        metrics 为 None 或无混淆矩阵（分类任务/失败/训练中）时清空——
+        表只对检测/分割的历史详情与训练完成态有意义。
+        """
+        from ..engine.metrics.per_class import per_class_rows
+
+        t = self.per_class_table
+        t.setRowCount(0)
+        if not metrics:
+            return
+        cm = metrics.get("confusion_matrix")
+        classes = metrics.get("classes") or []
+        if not cm or not classes:
+            return
+        final = metrics.get("final") or {}
+        try:
+            rows = per_class_rows(cm, classes, final.get("per_class_ap50"))
+        except ValueError:  # 尺寸不符（异常档位）不阻塞详情展示
+            return
+
+        def _s(v):
+            if v is None:
+                return "-"
+            return f"{v:.3f}" if isinstance(v, float) else str(v)
+
+        t.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            vals = [row["label"], _s(row["gt"]), _s(row["pred"]), _s(row["tp"]),
+                    _s(row["fp"]), _s(row["fn"]), _s(row["precision"]),
+                    _s(row["recall"]), _s(row["ap50"])]
+            for c, text in enumerate(vals):
+                t.setItem(r, c, QTableWidgetItem(text))
 
     @staticmethod
     def _summarize_metrics(metrics: dict) -> str:
@@ -2279,9 +2457,29 @@ class ProjectWindow(QMainWindow):
         final = metrics.get("final") or {}
         for key, label in (("map_loose", "mAP"), ("map50", "mAP@50"),
                            ("map50_95", "mAP@50-95"), ("mar_loose", "mAR"),
-                           ("precision", "精确率"), ("recall", "召回率")):
-            if key in final:
+                           ("precision", "精确率"), ("recall", "召回率"),
+                           ("auroc", "AUROC"), ("ap", "AP"),
+                           ("ok_fp_rate", "OK 误报率"), ("exact_match", "精确匹配"),
+                           ("cer", "CER"), ("char_acc", "字符准确率")):
+            if key in final and final[key] is not None:
                 parts.append(f"{label}：{final[key]:.3f}")
+        # O9（V0.7）：OK 负样本贡献常驻可见（能力已在，让用户看见）
+        neg_train = metrics.get("neg_train_images")
+        if neg_train:
+            neg_val = final.get("neg_val_images")
+            fp = final.get("neg_fp_per_img")
+            ok_txt = f"OK 负样本：训练 {neg_train} 张"
+            if neg_val is not None:
+                ok_txt += f" / 验证 {neg_val} 张"
+            if fp is not None:
+                ok_txt += f"，误检 {fp:.2f} 框/张"
+            parts.append(ok_txt)
+        # O3（V0.7）：Loss 曲线自动判读（欠拟合/过拟合/NaN 一句话）
+        from .loss_diagnosis import diagnose
+
+        d = diagnose(metrics.get("history") or [])
+        if d.get("text"):
+            parts.append(d["text"])
         return "　|　".join(parts)
 
     def _stop_training(self):
@@ -2367,6 +2565,9 @@ class ProjectWindow(QMainWindow):
             return
         if self.on_closed is not None:
             self.on_closed(self.project.name)
+        dg = getattr(self, "data_grid", None)
+        if dg is not None:      # O11：缩略/扫描线程收尾（P144 纪律）
+            dg.shutdown()
         event.accept()
 
 
@@ -2581,18 +2782,61 @@ class TrainingWindow(QMainWindow):
 
     # ---- 打开 / 删除 ----
     def _open_project(self, name: str):
+        from PyQt5.QtCore import Qt as _Qt
+
         window = self._project_windows.get(name)
         if window is not None and window.isVisible():
             window.activateWindow()
             window.raise_()
             return
-        window = ProjectWindow(
-            load_project(name),
-            on_renamed=self._on_project_renamed,
-            on_closed=self._on_project_closed,
-        )
-        window.show()
+        # 打开项目要加载深度学习组件（渲染卡数秒）——顶部悬浮胶囊提示
+        # （U1：对齐标注平台横幅样式，单行/半透明/圆角；颜色与标注平台
+        # 的琥珀底作微差取暗暖灰；V0.7）
+        banner = QLabel(f"正在打开项目「{name}」…", self)
+        banner.setObjectName("openProjectBanner")
+        banner.setStyleSheet(
+            "QLabel#openProjectBanner { background: rgba(58, 46, 34, 224);"
+            " color: white; padding: 6px 18px; border-radius: 12px;"
+            " font-weight: bold; font-size: 13px; }")
+        banner.adjustSize()
+        banner.move((self.width() - banner.width()) // 2, 12)
+        banner.show()
+        banner.raise_()
+        QApplication.processEvents()
+        self.statusBar().showMessage(f"正在打开项目「{name}」…", 8000)
+        QApplication.setOverrideCursor(_Qt.WaitCursor)
+        try:
+            window = ProjectWindow(
+                load_project(name),
+                on_renamed=self._on_project_renamed,
+                on_closed=self._on_project_closed,
+            )
+            window.show()
+        finally:
+            QApplication.restoreOverrideCursor()
+            banner.hide()
+            banner.setParent(None)
+            banner.deleteLater()
+        self.statusBar().showMessage(f"项目「{name}」已打开", 4000)
         self._project_windows[name] = window
+
+    def on_platform_message(self, args):
+        """单实例激活携带业务参数：args[0]=项目名 → 直接打开该项目。
+
+        主界面「最近项目」卡片在训练平台已运行时点下：新进程把项目名经
+        单实例管道转发到本钩子（第四批修复：此前只激活窗口不打开项目）。
+        """
+        name = args[0] if args else ""
+        if not name:
+            return
+        QTimer.singleShot(0, lambda: self._safe_open(name))
+
+    def _safe_open(self, name: str):
+        try:
+            self._open_project(name)
+        except Exception as e:   # 项目不存在/损坏：人话提示
+            QMessageBox.warning(self, "打开项目失败",
+                                f"项目「{name}」无法打开：{e}")
 
     def _confirm_delete(self, name: str):
         if QMessageBox.question(self, "删除项目",
